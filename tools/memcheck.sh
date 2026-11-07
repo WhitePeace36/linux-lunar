@@ -19,6 +19,13 @@ printf '  %-32s %s\n' ttm.low_latency_alloc \
 	"$(val /sys/module/ttm/parameters/low_latency_alloc)"
 
 echo
+echo "== patch 6: bounded LRU drains (needs patched kernel)"
+printf '  %-32s %s\n' vm.lru_drain_timeout_ms "$(sysctl -n vm.lru_drain_timeout_ms 2>/dev/null || echo n/a)"
+for k in lru_drain_timeout lru_drain_slow; do
+	printf '  %-32s %s\n' "$k (since boot)" "$(awk -v k=$k '$1 == k { print $2; f = 1 } END { if (!f) print "n/a" }' /proc/vmstat)"
+done
+
+echo
 echo "== watermarks / reclaim / compaction"
 for k in watermark_scale_factor watermark_boost_factor compaction_proactiveness \
 	 extfrag_threshold min_free_kbytes swappiness page-cluster vfs_cache_pressure; do

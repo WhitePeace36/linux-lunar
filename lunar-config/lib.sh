@@ -22,10 +22,10 @@ _LUNAR_OPTIONS=(
 	_timer_freq _preempt _preempt_dynamic _tickless _nr_cpus
 	_thp_enabled _thp_defrag _mglru
 	_patch_filemap_large_folios _patch_boost_min_wmark _patch_ttm_low_latency
-	_patch_soft_defrag_mode _patch_kswapd_hopeless
+	_patch_soft_defrag_mode _patch_kswapd_hopeless _patch_lru_drain_bounded
 	_default_defrag_mode _default_watermark_scale_factor
 	_default_watermark_boost_factor _default_compaction_proactiveness
-	_default_swappiness _default_ttm_low_latency
+	_default_swappiness _default_ttm_low_latency _default_lru_drain_timeout_ms
 	_user_patches _user_patches_confirm _build_headers _noninteractive
 	_cleanup_on_abort _cleanup_after_build
 )
@@ -81,6 +81,12 @@ lunar_validate_options() {
 		|| _l_die "_default_swappiness must be 0..200"
 	if _l_true "$_default_ttm_low_latency" && ! _l_true "$_patch_ttm_low_latency"; then
 		_l_die "_default_ttm_low_latency=true needs _patch_ttm_low_latency=true"
+	fi
+	if [[ -n "$_default_lru_drain_timeout_ms" ]]; then
+		_l_int_range "$_default_lru_drain_timeout_ms" 0 1000 \
+			|| _l_die "_default_lru_drain_timeout_ms must be 0..1000"
+		_l_true "$_patch_lru_drain_bounded" \
+			|| _l_die "_default_lru_drain_timeout_ms needs _patch_lru_drain_bounded=true (or leave it empty)"
 	fi
 	return 0
 }
@@ -258,6 +264,11 @@ lunar_set_defaults() {
 		_l_set_line drivers/gpu/drm/ttm/ttm_pool.c '^static bool ttm_pool_low_latency;$' \
 			'static bool ttm_pool_low_latency = true;'
 	fi
+	if [[ -n "$_default_lru_drain_timeout_ms" ]]; then
+		_l_msg2 "vm.lru_drain_timeout_ms = $_default_lru_drain_timeout_ms"
+		_l_set_line mm/folio.c '^static unsigned int sysctl_lru_drain_timeout_ms __read_mostly = [0-9]+;$' \
+			"static unsigned int sysctl_lru_drain_timeout_ms __read_mostly = $_default_lru_drain_timeout_ms;"
+	fi
 
 	local flag
 	case "$_thp_defrag" in
@@ -318,8 +329,10 @@ lunar_configure() {
 	[[ -n "$_nr_cpus" ]] && _l_cfg --set-val NR_CPUS "$_nr_cpus"
 
 	# memory: what the lunar patches and their measurement tools rely on
+	# (IRQ_TIME_ACCOUNTING: exact interrupt CPU time and /proc/pressure/irq
+	# for devwatch.sh and devguard)
 	_l_cfg -e TRANSPARENT_HUGEPAGE -e COMPACTION -e MIGRATION -e PSI -d PSI_DEFAULT_DISABLED \
-	       -e SWAP -e MEMCG
+	       -e SWAP -e MEMCG -e IRQ_TIME_ACCOUNTING
 	case "$_thp_enabled" in
 		always)  _l_cfg -e TRANSPARENT_HUGEPAGE_ALWAYS -d TRANSPARENT_HUGEPAGE_MADVISE -d TRANSPARENT_HUGEPAGE_NEVER ;;
 		madvise) _l_cfg -d TRANSPARENT_HUGEPAGE_ALWAYS -e TRANSPARENT_HUGEPAGE_MADVISE -d TRANSPARENT_HUGEPAGE_NEVER ;;
@@ -370,6 +383,7 @@ lunar_check_config() {
 	esac
 	[[ "$_march" == native ]] && want+=(CONFIG_X86_NATIVE_CPU=y)
 	want+=("CONFIG_TRANSPARENT_HUGEPAGE_${_thp_enabled^^}=y" CONFIG_COMPACTION=y CONFIG_PSI=y)
+	want+=(CONFIG_IRQ_TIME_ACCOUNTING=y)
 	_l_true "$_mglru" && want+=(CONFIG_LRU_GEN_ENABLED=y)
 	for w in "${want[@]}"; do
 		grep -qx "$w" .config || _l_warn "Wanted $w, but Kconfig did not keep it (missing dependency?)"

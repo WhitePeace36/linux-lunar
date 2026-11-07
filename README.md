@@ -36,8 +36,8 @@ For PGP-verified stable tarballs, import the kernel.org keys once:
 
 | Series | Based on | Status |
 | --- | --- | --- |
-| 7.3 | 7.3.1 | all five patches booted and load-tested on one machine (see below) |
-| 7.4 | 7.4-rc1 | compile-tested only |
+| 7.3 | 7.3.1 | 0001-0005 booted and load-tested on one machine, 0006 tested in QEMU (see below) |
+| 7.4 | 7.4-rc1 | 0001-0005 compile-tested only, 0006 tested in QEMU |
 
 A newer point release of the same series (e.g. 7.3.2) usually applies
 unchanged. If a patch stops applying, the build stops with an error instead of
@@ -54,6 +54,7 @@ Each can be switched off in `customization.cfg`.
 | 0003 | `_patch_ttm_low_latency` | `ttm.low_latency_alloc`: GPU buffer allocations (amdgpu and other TTM drivers) do one bounded reclaim/compaction round for 2 MiB pages instead of retrying hard. |
 | 0004 | `_patch_soft_defrag_mode` | `vm.defrag_mode=2`: kswapd/kcompactd keep whole free 2 MiB blocks like mode 1, but allocations never stall just to avoid a migratetype fallback. |
 | 0005 | `_patch_kswapd_hopeless` | A kswapd that gave up ("hopeless") is revived by its own or by global direct-reclaim progress again, not only once free memory is back above the high watermark. |
+| 0006 | `_patch_lru_drain_bounded` | `vm.lru_drain_timeout_ms`: khugepaged, MADV_COLLAPSE, `fadvise(DONTNEED)`, KSM, `memory.reclaim` and `drop_caches` stop waiting after 20 ms for a CPU that can't run its LRU drain work (interrupt storm, stuck driver, ...), instead of stalling, and everyone queued behind them with it. Callers that need the drain (migration, GUP pins, ...) still wait, but the kernel log now names the stuck CPU after 1 s. Counters: `lru_drain_timeout`, `lru_drain_slow` in `/proc/vmstat`. |
 
 ## Compiled-in defaults
 
@@ -67,6 +68,7 @@ Set in `customization.cfg`, all still changeable at runtime:
 | `vm.compaction_proactiveness` | 50 | 20 |
 | `vm.swappiness` | 150 | 60 |
 | `ttm.low_latency_alloc` | Y | N |
+| `vm.lru_drain_timeout_ms` | 20 | (patch 0006 only) |
 | THP enabled / defrag | always / defer | Kconfig / madvise |
 
 `watermark_boost_factor` is a percentage of the high watermark, so it is kept
@@ -117,10 +119,21 @@ build.
 | `memstress.c` | provoke stalls: fragmented page cache, pinned unmovable pages, THP heap, streaming reads, optional 2:1-compressible anonymous load (`-a GiB`) for zram |
 | `memstall.bt` | bpftrace: every direct reclaim / compaction stall > 1 ms with process and order |
 | `fragwatch.sh` | live fragmentation score, free 2 MiB blocks, kswapd state, compaction migrations and THP success per second |
+| `devwatch.sh` | find a misbehaving device: PSI irq/cpu/io/mem, busiest IRQ lines, new PCIe AER errors per device, busiest kernel threads, new kernel errors and USB disconnects (`sudo ./devwatch.sh 1`) |
+| `draintest.c` | reproduce the stall patch 0006 fixes: an RT task on one CPU keeps that CPU's LRU cache full while `drop_caches` / `compact_memory` wait for it (`gcc -O2 -o tools/draintest tools/draintest.c`) |
 
 `memstress -q <sec> -B <MiB> -t 0` tests proactive compaction on its own: after
 the fragmenting setup it stays idle for `<sec>` seconds, then touches one THP
 burst and reports how many 2 MiB chunks got a huge page.
+
+## devguard
+
+[`devguard/`](devguard/) is a separate, kernel-independent service that keeps
+one misbehaving device from stalling the whole system: it moves a storming IRQ
+to a housekeeping CPU, turns off ASPM / masks correctable AER errors on a
+flooding PCIe link, disables a USB port stuck in a reconnect loop and quiets
+the console during a kernel log flood. It starts in observe mode (log only);
+see [devguard/README.md](devguard/README.md).
 
 ## Test status
 
@@ -139,6 +152,14 @@ burst and reports how many 2 MiB chunks got a huge page.
   reverted. `memstress -a 16`, 120 s: `allocstall` 819,999 → about 1,500,
   `compact_stall` 11,290 → 0-78, THP fallbacks 99.9 % → 0.06-0.3 %,
   PSI memory 26.6 s → 1-2.4 s.
+- Patch 0006 on 7.3.1 and 7.4-rc1 in QEMU (2 vCPUs, PROVE_LOCKING), with a
+  SCHED_FIFO task faulting in pages on CPU 1 and CPU 1's fair server off:
+  `drop_caches` waited 4.97-5.06 s with `lru_drain_timeout_ms=0` (old
+  behaviour) and 26-34 ms with 20; `compact_memory` (a caller that must
+  wait) still waited and the stuck CPU was logged; with the fair server at
+  its default, both settings behaved the same. No lockdep reports.
+- devguard: 38 fixture checks (simulated IRQ storms, AER floods, USB loops,
+  log floods) and a live kernel-log flood; not yet on real faulty hardware.
 - Not tested yet: a full Arch/CachyOS config build of linux-lunar on real
   hardware, LLVM/LTO, PREEMPT_RT, NVIDIA DKMS against the headers package.
   One machine is not a benchmark.

@@ -1,0 +1,562 @@
+From 23556a5d724d38fca0f6e22f98fd456b93fc6343 Mon Sep 17 00:00:00 2001
+From: "Claude (draft)" <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 16:52:27 +0100
+Subject: [PATCH] mm/folio: don't let one unresponsive CPU stall best-effort
+ LRU drains
+
+lru_add_drain_all() queues a work item on every CPU whose per-CPU LRU
+caches are not empty and then flush_work()s each of them, all under a
+global mutex. A CPU that cannot run its kworker for a while - a
+hardirq storm from a broken device, a long irqs- or preempt-off
+section, a runaway SCHED_FIFO task when the fair server is disabled,
+a misbehaving sched_ext scheduler - therefore stalls not only the
+caller but everyone who queues up behind it on the mutex.
+
+Most callers only drain as an optimisation: khugepaged before each
+scan pass, MADV_COLLAPSE, POSIX_FADV_DONTNEED, KSM, the last retry of
+proactive memory.reclaim and drop_caches. For them a stale per-CPU
+cache on one CPU only means a few folios are skipped this time.
+
+Add lru_add_drain_all_bounded() for these callers. It gives up after
+vm.lru_drain_timeout_ms (default 20 ms), both while waiting for the
+mutex and while waiting for the per-CPU works, and counts that as
+lru_drain_timeout in /proc/vmstat. Callers that need the drain for
+correctness (migration via lru_cache_disable(), long-term GUP pins,
+memfd sealing, compaction via sysctl, memory-failure, ...) keep the
+old semantics, but if they wait for longer than a second the stuck
+CPUs are now named in the kernel log and lru_drain_slow is counted.
+
+To make that possible:
+ - each per-CPU work records the drain generation it started under,
+   so waiters can wait with a timeout instead of flush_work();
+ - "a newer generation was scheduled" no longer implies "it has
+   completed", so the early exit at (C) now checks a separate
+   lru_drain_completed generation;
+ - the work items are initialised once instead of on every round, as
+   one left pending by a bounded drain must not be re-initialised.
+
+Tested in QEMU (2 vCPUs, 7.3.1 with PROVE_LOCKING), with a SCHED_FIFO
+task faulting in pages on CPU1 and CPU1's fair server set to 0:
+  drop_caches, lru_drain_timeout_ms=0:  first call 4974-5064 ms
+  drop_caches, lru_drain_timeout_ms=20: every call 26-34 ms
+  compact_memory (strict) with the hog:  ~4083 ms, CPU 1 reported
+  drop_caches while compact_memory holds the mutex: 25-30 ms
+With the fair server left at its default both settings behave the
+same (no timeouts). No lockdep reports.
+
+DRAFT for linux-lunar; not submitted upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
+---
+ Documentation/admin-guide/sysctl/vm.rst |  24 +++
+ fs/drop_caches.c                        |   2 +-
+ include/linux/swap.h                    |   1 +
+ include/linux/vm_event_item.h           |   1 +
+ mm/fadvise.c                            |   2 +-
+ mm/folio.c                              | 253 +++++++++++++++++++++---
+ mm/khugepaged.c                         |   4 +-
+ mm/ksm.c                                |   2 +-
+ mm/vmscan.c                             |   2 +-
+ mm/vmstat.c                             |   2 +
+ 10 files changed, 257 insertions(+), 36 deletions(-)
+
+diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
+index ede120e9d..1a5252165 100644
+--- a/Documentation/admin-guide/sysctl/vm.rst
++++ b/Documentation/admin-guide/sysctl/vm.rst
+@@ -40,6 +40,7 @@ Currently, these files are in /proc/sys/vm:
+ - hugetlb_shm_group
+ - legacy_va_layout
+ - lowmem_reserve_ratio
++- lru_drain_timeout_ms
+ - max_map_count
+ - mem_profiling         (only if CONFIG_MEM_ALLOC_PROFILING=y)
+ - memory_failure_early_kill
+@@ -470,6 +471,29 @@ The minimum value is 1 (1/1 -> 100%). The value less than 1 completely
+ disables protection of the pages.
+ 
+ 
++lru_drain_timeout_ms
++====================
++
++Some kernel paths flush the per-CPU LRU caches of every CPU by queueing a
++work item on each CPU and waiting for it to run. If a CPU cannot run its
++kworker for a while (for example because of an interrupt storm, a busy
++real-time task or a misbehaving driver), all of them wait for that CPU.
++
++For callers that only drain as an optimisation (khugepaged and
++MADV_COLLAPSE, POSIX_FADV_DONTNEED, KSM, proactive memory.reclaim and
++drop_caches) this sysctl bounds that wait, in milliseconds. If the time
++runs out they carry on without the remaining CPUs and the
++``lru_drain_timeout`` counter in /proc/vmstat is incremented; the
++remaining work items still run later. Callers that depend on the drain
++for correctness (page migration, long-term page pinning, contiguous
++allocations, memory hotplug, ...) always wait. If one of those waits for
++longer than a second, the stuck CPUs are reported in the kernel log and
++``lru_drain_slow`` is incremented.
++
++0 makes the bounded callers wait as long as necessary as well. The
++default is 20, the maximum 1000.
++
++
+ max_map_count
+ =============
+ 
+diff --git a/fs/drop_caches.c b/fs/drop_caches.c
+index 49f56a598..5097a4165 100644
+--- a/fs/drop_caches.c
++++ b/fs/drop_caches.c
+@@ -60,7 +60,7 @@ static int drop_caches_sysctl_handler(const struct ctl_table *table, int write,
+ 		static int stfu;
+ 
+ 		if (sysctl_drop_caches & 1) {
+-			lru_add_drain_all();
++			lru_add_drain_all_bounded();
+ 			iterate_supers(drop_pagecache_sb, NULL);
+ 			count_vm_event(DROP_PAGECACHE);
+ 		}
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 5658a1634..a483c7b38 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -297,6 +297,7 @@ extern unsigned long totalreserve_pages;
+ void folio_add_lru(struct folio *folio);
+ void folio_mark_accessed(struct folio *folio);
+ void lru_add_drain_all(void);
++bool lru_add_drain_all_bounded(void);
+ 
+ enum lru_cache_drained {
+ 	LRU_CACHE_NOT_DRAINED,
+diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
+index 2628ccda0..7acb26d0a 100644
+--- a/include/linux/vm_event_item.h
++++ b/include/linux/vm_event_item.h
+@@ -48,6 +48,7 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ 		KSWAPD_LOW_WMARK_HIT_QUICKLY, KSWAPD_HIGH_WMARK_HIT_QUICKLY,
+ 		PAGEOUTRUN, PGROTATED,
+ 		DROP_PAGECACHE, DROP_SLAB,
++		LRU_DRAIN_TIMEOUT, LRU_DRAIN_SLOW,
+ 		OOM_KILL,
+ #ifdef CONFIG_NUMA_BALANCING
+ 		NUMA_PTE_UPDATES,
+diff --git a/mm/fadvise.c b/mm/fadvise.c
+index b63fe2141..807b48505 100644
+--- a/mm/fadvise.c
++++ b/mm/fadvise.c
+@@ -163,7 +163,7 @@ int generic_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
+ 			 * caches and try again.
+ 			 */
+ 			if (nr_failed) {
+-				lru_add_drain_all();
++				lru_add_drain_all_bounded();
+ 				invalidate_mapping_pages(mapping, start_index,
+ 						end_index);
+ 			}
+diff --git a/mm/folio.c b/mm/folio.c
+index 50a6dbe55..fa645eaf1 100644
+--- a/mm/folio.c
++++ b/mm/folio.c
+@@ -34,6 +34,7 @@
+ #include <linux/local_lock.h>
+ #include <linux/buffer_head.h>
+ #include <linux/kvm_types.h>
++#include <linux/sysctl.h>
+ 
+ #include "internal.h"
+ #include "page_alloc.h"
+@@ -746,11 +747,66 @@ void lru_add_drain_cpu_zone(struct zone *zone)
+ 
+ #ifdef CONFIG_SMP
+ 
+-static DEFINE_PER_CPU(struct work_struct, lru_add_drain_work);
++/*
++ * One drain work item per CPU. @done_gen records the lru_drain_gen that
++ * was current when the work last started draining that CPU, so a waiter
++ * can tell from the outside whether a CPU has been drained since it
++ * started its own round, without flush_work().
++ */
++struct lru_drain_work {
++	struct work_struct work;
++	unsigned int done_gen;
++};
++
++static DEFINE_PER_CPU(struct lru_drain_work, lru_drain_works);
++
++/*
++ * lru_drain_gen - Global pages generation number
++ *
++ * (A) Definition: global lru_drain_gen = x implies that all generations
++ *     0 < n <= x are already *scheduled* for draining.
++ *
++ * lru_drain_completed - newest generation whose drain has finished on
++ * every CPU that needed it. Only written with lru_drain_lock held.
++ *
++ * These two used to be the same thing, because the mutex was held until
++ * every CPU had drained. lru_add_drain_all_bounded() can now drop the
++ * mutex while some per-CPU works are still pending, so "scheduled" no
++ * longer implies "done".
++ */
++static unsigned int lru_drain_gen;
++static unsigned int lru_drain_completed;
++static DEFINE_MUTEX(lru_drain_lock);
++static DECLARE_WAIT_QUEUE_HEAD(lru_drain_wq);
++
++/*
++ * How long lru_add_drain_all_bounded() may wait, in total, for the drain
++ * mutex and for the per-CPU drain works. 0 makes it behave exactly like
++ * lru_add_drain_all().
++ */
++static unsigned int sysctl_lru_drain_timeout_ms __read_mostly = 20;
++
++/* After this long, a strict drain reports which CPUs it is waiting for. */
++#define LRU_DRAIN_WARN_MS	1000
+ 
+-static void lru_add_drain_per_cpu(struct work_struct *dummy)
++static void lru_add_drain_per_cpu(struct work_struct *work)
+ {
++	struct lru_drain_work *dw = container_of(work, struct lru_drain_work,
++						 work);
++	/*
++	 * Sample the generation before draining: if a waiter sees
++	 * done_gen >= its own generation, this drain started after that
++	 * generation was published and so after the waiter's own folio
++	 * batch updates (see (D) below). Pending work items only start
++	 * after the queueing CPU's (D), see process_one_work().
++	 */
++	unsigned int gen = READ_ONCE(lru_drain_gen);
++
+ 	lru_add_and_bh_lrus_drain();
++
++	/* Pairs with smp_load_acquire() in lru_drain_cpus_done(). */
++	smp_store_release(&dw->done_gen, gen);
++	wake_up_all(&lru_drain_wq);
+ }
+ 
+ static bool cpu_needs_drain(unsigned int cpu)
+@@ -768,36 +824,83 @@ static bool cpu_needs_drain(unsigned int cpu)
+ 		has_bh_in_lru(cpu, NULL);
+ }
+ 
++static bool lru_drain_cpus_done(const struct cpumask *mask, unsigned int gen)
++{
++	unsigned int cpu;
++
++	for_each_cpu(cpu, mask) {
++		unsigned int done =
++			smp_load_acquire(&per_cpu(lru_drain_works, cpu).done_gen);
++
++		if ((int)(done - gen) < 0)
++			return false;
++	}
++	return true;
++}
++
++/* Clear @mask bits of CPUs that have already drained for @gen. */
++static void lru_drain_cpus_pending(struct cpumask *mask, unsigned int gen)
++{
++	unsigned int cpu;
++
++	for_each_cpu(cpu, mask) {
++		unsigned int done =
++			smp_load_acquire(&per_cpu(lru_drain_works, cpu).done_gen);
++
++		if ((int)(done - gen) >= 0)
++			__cpumask_clear_cpu(cpu, mask);
++	}
++}
++
++/*
++ * Take lru_drain_lock, giving up at @deadline. Holders wake lru_drain_wq
++ * on release, so this sleeps instead of spinning.
++ */
++static bool lru_drain_lock_until(unsigned long deadline)
++{
++	while (!mutex_trylock(&lru_drain_lock)) {
++		long left = (long)(deadline - jiffies);
++
++		if (left <= 0)
++			return false;
++		wait_event_timeout(lru_drain_wq,
++				   !mutex_is_locked(&lru_drain_lock), left);
++	}
++	return true;
++}
++
++static void lru_drain_unlock(void)
++{
++	mutex_unlock(&lru_drain_lock);
++	wake_up_all(&lru_drain_wq);
++}
++
+ /*
+  * Doesn't need any cpu hotplug locking because we do rely on per-cpu
+  * kworkers being shut down before our page_alloc_cpu_dead callback is
+  * executed on the offlined cpu.
+  * Calling this function with cpu hotplug locks held can actually lead
+  * to obscure indirect dependencies via WQ context.
++ *
++ * @timeout: 0 to wait for every CPU, however long it takes (the classic
++ * semantics). Otherwise the maximum number of jiffies to wait for the
++ * mutex and the per-CPU works together; returns false if that ran out,
++ * in which case some remote per-CPU caches may not have been drained yet
++ * (their works stay queued and will drain them when they get to run).
+  */
+-static inline void __lru_add_drain_all(bool force_all_cpus)
++static bool __lru_add_drain_all(bool force_all_cpus, unsigned long timeout)
+ {
+-	/*
+-	 * lru_drain_gen - Global pages generation number
+-	 *
+-	 * (A) Definition: global lru_drain_gen = x implies that all generations
+-	 *     0 < n <= x are already *scheduled* for draining.
+-	 *
+-	 * This is an optimization for the highly-contended use case where a
+-	 * user space workload keeps constantly generating a flow of pages for
+-	 * each CPU.
+-	 */
+-	static unsigned int lru_drain_gen;
+ 	static struct cpumask has_work;
+-	static DEFINE_MUTEX(lock);
+-	unsigned cpu, this_gen;
++	unsigned long deadline = jiffies + timeout;
++	unsigned int cpu, this_gen, round_gen;
++	bool done = true;
+ 
+ 	/*
+ 	 * Make sure nobody triggers this path before mm_percpu_wq is fully
+ 	 * initialized.
+ 	 */
+ 	if (WARN_ON(!mm_percpu_wq))
+-		return;
++		return true;
+ 
+ 	trace_mm_lru_add_drain_all_tp(force_all_cpus);
+ 
+@@ -820,14 +923,23 @@ static inline void __lru_add_drain_all(bool force_all_cpus)
+ 	/* It helps everyone if we do our own local drain immediately. */
+ 	lru_add_drain();
+ 
+-	mutex_lock(&lock);
++	if (!timeout) {
++		mutex_lock(&lru_drain_lock);
++	} else if (!lru_drain_lock_until(deadline)) {
++		/* Someone else is stuck draining; don't queue up behind them. */
++		count_vm_event(LRU_DRAIN_TIMEOUT);
++		return false;
++	}
+ 
+ 	/*
+ 	 * (C) Exit the draining operation if a newer generation, from another
+-	 * lru_add_drain_all(), was already scheduled for draining. Check (A).
++	 * lru_add_drain_all(), has already been drained completely. Check (A).
++	 * A generation newer than this_gen was scheduled after our folio
++	 * batch updates became visible, see (D).
+ 	 */
+-	if (unlikely(this_gen != lru_drain_gen && !force_all_cpus))
+-		goto done;
++	if (unlikely((int)(lru_drain_completed - this_gen) > 0 &&
++		     !force_all_cpus))
++		goto unlock;
+ 
+ 	/*
+ 	 * (D) Increment global generation number
+@@ -850,36 +962,117 @@ static inline void __lru_add_drain_all(bool force_all_cpus)
+ 	 * loop, CPU #x will just exit at (C) and miss flushing out all of its
+ 	 * added pages.
+ 	 */
+-	WRITE_ONCE(lru_drain_gen, lru_drain_gen + 1);
++	round_gen = lru_drain_gen + 1;
++	WRITE_ONCE(lru_drain_gen, round_gen);
+ 	smp_mb();
+ 
+ 	cpumask_clear(&has_work);
+ 	for_each_online_cpu(cpu) {
+-		struct work_struct *work = &per_cpu(lru_add_drain_work, cpu);
++		struct work_struct *work = &per_cpu(lru_drain_works, cpu).work;
+ 
+ 		if (cpu_needs_drain(cpu)) {
+-			INIT_WORK(work, lru_add_drain_per_cpu);
++			/*
++			 * Initialise once only: a work item left pending by
++			 * a bounded drain that gave up must not be
++			 * re-initialised while it is queued.
++			 */
++			if (unlikely(!work->func))
++				INIT_WORK(work, lru_add_drain_per_cpu);
+ 			queue_work_on(cpu, mm_percpu_wq, work);
+ 			__cpumask_set_cpu(cpu, &has_work);
+ 		}
+ 	}
+ 
+-	for_each_cpu(cpu, &has_work)
+-		flush_work(&per_cpu(lru_add_drain_work, cpu));
++	if (timeout) {
++		long left = (long)(deadline - jiffies);
++
++		if (left <= 0 || !wait_event_timeout(lru_drain_wq,
++				lru_drain_cpus_done(&has_work, round_gen), left)) {
++			count_vm_event(LRU_DRAIN_TIMEOUT);
++			done = false;
++			goto unlock;
++		}
++	} else {
++		/*
++		 * flush_work() below is what we rely on. The timed wait in
++		 * front of it only exists to name the CPUs that keep us
++		 * waiting for a long time, typically because something
++		 * (an interrupt storm, a runaway RT task, a stuck driver)
++		 * keeps them from running their kworker.
++		 */
++		if (!wait_event_timeout(lru_drain_wq,
++				lru_drain_cpus_done(&has_work, round_gen),
++				msecs_to_jiffies(LRU_DRAIN_WARN_MS))) {
++			lru_drain_cpus_pending(&has_work, round_gen);
++			count_vm_event(LRU_DRAIN_SLOW);
++			pr_warn_ratelimited("lru_add_drain_all: %s waiting >%ums for CPUs %*pbl to run their drain work\n",
++					    current->comm, LRU_DRAIN_WARN_MS,
++					    cpumask_pr_args(&has_work));
++		}
++		for_each_cpu(cpu, &has_work)
++			flush_work(&per_cpu(lru_drain_works, cpu).work);
++	}
+ 
+-done:
+-	mutex_unlock(&lock);
++	lru_drain_completed = round_gen;
++unlock:
++	lru_drain_unlock();
++	return done;
+ }
+ 
+ void lru_add_drain_all(void)
+ {
+-	__lru_add_drain_all(false);
++	__lru_add_drain_all(false, 0);
++}
++
++/**
++ * lru_add_drain_all_bounded() - drain LRU caches on all CPUs, but don't
++ *				 wait for unresponsive CPUs for long
++ *
++ * Like lru_add_drain_all(), but gives up after vm.lru_drain_timeout_ms
++ * instead of waiting for every CPU to run its drain work. Meant for
++ * callers to whom draining is an optimisation (khugepaged, fadvise,
++ * KSM, proactive reclaim, ...): one CPU that cannot run its kworker
++ * should not stall them, or everyone queued behind them on the drain
++ * mutex.
++ *
++ * Return: true if every CPU's caches were drained, false if it gave up.
++ */
++bool lru_add_drain_all_bounded(void)
++{
++	unsigned int ms = READ_ONCE(sysctl_lru_drain_timeout_ms);
++
++	return __lru_add_drain_all(false, ms ? max(msecs_to_jiffies(ms), 1UL) : 0);
++}
++
++static const struct ctl_table lru_drain_sysctl_table[] = {
++	{
++		.procname	= "lru_drain_timeout_ms",
++		.data		= &sysctl_lru_drain_timeout_ms,
++		.maxlen		= sizeof(sysctl_lru_drain_timeout_ms),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE_THOUSAND,
++	},
++};
++
++static int __init lru_drain_sysctl_init(void)
++{
++	register_sysctl_init("vm", lru_drain_sysctl_table);
++	return 0;
+ }
++subsys_initcall(lru_drain_sysctl_init);
+ #else
+ void lru_add_drain_all(void)
+ {
+ 	lru_add_drain();
+ }
++
++bool lru_add_drain_all_bounded(void)
++{
++	lru_add_drain();
++	return true;
++}
+ #endif /* CONFIG_SMP */
+ 
+ /**
+@@ -957,7 +1150,7 @@ void lru_cache_disable(void)
+ 	 */
+ 	synchronize_rcu_expedited();
+ #ifdef CONFIG_SMP
+-	__lru_add_drain_all(true);
++	__lru_add_drain_all(true, 0);
+ #else
+ 	lru_add_and_bh_lrus_drain();
+ #endif
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 75639298e..f01ac62b7 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -2975,7 +2975,7 @@ static void khugepaged_do_scan(struct collapse_control *cc)
+ 	bool wait = true;
+ 	enum scan_result result = SCAN_SUCCEED;
+ 
+-	lru_add_drain_all();
++	lru_add_drain_all_bounded();
+ 
+ 	cc->progress = 0;
+ 	while (true) {
+@@ -3208,7 +3208,7 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
+ 	cc->progress = 0;
+ 
+ 	mmgrab(mm);
+-	lru_add_drain_all();
++	lru_add_drain_all_bounded();
+ 
+ 	for (addr = hstart; addr < hend; addr += HPAGE_PMD_SIZE) {
+ 		enum scan_result result = SCAN_FAIL;
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 49d48d1e0..a8189c912 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -2635,7 +2635,7 @@ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
+ 		 * them here (here rather than on entry to ksm_do_scan(),
+ 		 * so we don't IPI too often when pages_to_scan is set low).
+ 		 */
+-		lru_add_drain_all();
++		lru_add_drain_all_bounded();
+ 
+ 		/*
+ 		 * Whereas stale stable_nodes on the stable_tree itself
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 04d2fa6c4..0e972b30e 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -8047,7 +8047,7 @@ int user_proactive_reclaim(char *buf,
+ 		 * hope of introducing more evictable pages.
+ 		 */
+ 		if (!nr_retries)
+-			lru_add_drain_all();
++			lru_add_drain_all_bounded();
+ 
+ 		if (memcg) {
+ 			unsigned int reclaim_options;
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index cb5771453..fc0b7b4a5 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1366,6 +1366,8 @@ const char * const vmstat_text[] = {
+ 
+ 	[I(DROP_PAGECACHE)]			= "drop_pagecache",
+ 	[I(DROP_SLAB)]				= "drop_slab",
++	[I(LRU_DRAIN_TIMEOUT)]			= "lru_drain_timeout",
++	[I(LRU_DRAIN_SLOW)]			= "lru_drain_slow",
+ 	[I(OOM_KILL)]				= "oom_kill",
+ 
+ #ifdef CONFIG_NUMA_BALANCING
+-- 
+2.43.0
+

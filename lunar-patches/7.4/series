@@ -4,3 +4,4 @@ _patch_boost_min_wmark        0002-mm-page_alloc-don-t-apply-watermark-boost-to-
 _patch_ttm_low_latency        0003-drm-ttm-add-low_latency_alloc-parameter-to-bound-ben.patch
 _patch_soft_defrag_mode       0004-mm-page_alloc-add-soft-defrag_mode-vm.defrag_mode-2.patch
 _patch_kswapd_hopeless        0005-mm-vmscan-let-kswapd-and-global-direct-reclaim-reviv.patch
+_patch_lru_drain_bounded      0006-mm-folio-don-t-let-one-unresponsive-CPU-stall-best-e.patch
