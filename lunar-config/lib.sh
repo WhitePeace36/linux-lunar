@@ -19,7 +19,7 @@ _LUNAR_OPTIONS=(
 	_version _pkgsuffix _localversion _pgp_verify
 	_base_config _localmodconfig _modprobeddb_path _menuconfig
 	_compiler _lto_mode _march _kcflags _jobs
-	_timer_freq _preempt _preempt_dynamic _tickless _nr_cpus
+	_timer_freq _preempt _preempt_dynamic _tickless _nr_cpus _cpu_governor
 	_thp_enabled _thp_defrag _mglru
 	_patch_filemap_large_folios _patch_boost_min_wmark _patch_ttm_low_latency
 	_patch_soft_defrag_mode _patch_kswapd_hopeless _patch_lru_drain_bounded
@@ -48,6 +48,8 @@ _l_int_range() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= $2 && $1 <= $3 )); }
 
 # Check every option; die on the first invalid one.
 lunar_validate_options() {
+	_lto_mode="${_lto_mode:-none}"          # empty means no LTO
+	_cpu_governor="${_cpu_governor:-performance}"
 	_l_in "$_compiler" gcc llvm || _l_die "_compiler must be gcc or llvm (is '$_compiler')"
 	_l_in "$_lto_mode" none thin full || _l_die "_lto_mode must be none, thin or full"
 	if [[ "$_lto_mode" != none && "$_compiler" != llvm ]]; then
@@ -56,6 +58,8 @@ lunar_validate_options() {
 	_l_in "$_timer_freq" 100 250 300 1000 || _l_die "_timer_freq must be 100, 250, 300 or 1000"
 	_l_in "$_preempt" lazy full rt || _l_die "_preempt must be lazy, full or rt"
 	_l_in "$_tickless" periodic idle full || _l_die "_tickless must be periodic, idle or full"
+	_l_in "$_cpu_governor" performance schedutil powersave \
+		|| _l_die "_cpu_governor must be performance, schedutil or powersave"
 	_l_in "$_menuconfig" none menuconfig nconfig xconfig || _l_die "_menuconfig must be none, menuconfig, nconfig or xconfig"
 	_l_in "$_thp_enabled" always madvise never || _l_die "_thp_enabled must be always, madvise or never"
 	_l_in "$_thp_defrag" always defer defer+madvise madvise never || _l_die "_thp_defrag must be always, defer, defer+madvise, madvise or never"
@@ -328,9 +332,17 @@ lunar_configure() {
 
 	[[ -n "$_nr_cpus" ]] && _l_cfg --set-val NR_CPUS "$_nr_cpus"
 
+	# default cpufreq governor (one of a Kconfig choice; the governor itself
+	# is selected by the choice)
+	local g
+	for g in PERFORMANCE POWERSAVE USERSPACE ONDEMAND CONSERVATIVE SCHEDUTIL; do
+		_l_cfg -d "CPU_FREQ_DEFAULT_GOV_$g"
+	done
+	_l_cfg -e CPU_FREQ -e "CPU_FREQ_DEFAULT_GOV_${_cpu_governor^^}" -e "CPU_FREQ_GOV_${_cpu_governor^^}"
+
 	# memory: what the lunar patches and their measurement tools rely on
 	# (IRQ_TIME_ACCOUNTING: exact interrupt CPU time and /proc/pressure/irq
-	# for devwatch.sh and devguard)
+	# for devwatch.sh and LunarDeviceGuard)
 	_l_cfg -e TRANSPARENT_HUGEPAGE -e COMPACTION -e MIGRATION -e PSI -d PSI_DEFAULT_DISABLED \
 	       -e SWAP -e MEMCG -e IRQ_TIME_ACCOUNTING
 	case "$_thp_enabled" in
@@ -382,6 +394,7 @@ lunar_check_config() {
 		rt)   want+=(CONFIG_PREEMPT_RT=y) ;;
 	esac
 	[[ "$_march" == native ]] && want+=(CONFIG_X86_NATIVE_CPU=y)
+	want+=("CONFIG_CPU_FREQ_DEFAULT_GOV_${_cpu_governor^^}=y")
 	want+=("CONFIG_TRANSPARENT_HUGEPAGE_${_thp_enabled^^}=y" CONFIG_COMPACTION=y CONFIG_PSI=y)
 	want+=(CONFIG_IRQ_TIME_ACCOUNTING=y)
 	_l_true "$_mglru" && want+=(CONFIG_LRU_GEN_ENABLED=y)

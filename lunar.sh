@@ -116,17 +116,22 @@ if [[ -z "$_version" ]]; then
 	_l_true "$_noninteractive" && _l_die "_version is empty and _noninteractive is set"
 	_l_msg "Which kernel?"
 	_choices=()
+	_default=0   # 1-based; the newest "stable" release, else the newest of all
 	while read -r v m; do
 		_l_in "$(lunar_series_of "$v")" "${_series_list[@]}" || continue
 		_choices+=("$v ($m)")
+		[[ "$m" == stable ]] && _default=${#_choices[@]}
 	done < <(lunar_current_releases "$_where" | sort -V) || true
+	(( _default )) || _default=${#_choices[@]}
 	if (( ${#_choices[@]} == 0 )); then
 		_l_warn "Could not get the release list from kernel.org"
 		_ask "Kernel version (e.g. ${_series_list[-1]}):" ""
 		_version="$REPLY"
 	else
-		for i in "${!_choices[@]}"; do printf '  %d) %s\n' "$((i + 1))" "${_choices[$i]}"; done
-		_ask "Number or version [${#_choices[@]}]:" "${#_choices[@]}"
+		for i in "${!_choices[@]}"; do
+			printf '  %d) %s%s\n' "$((i + 1))" "${_choices[$i]}" "$( (( i + 1 == _default )) && echo '  <- default')"
+		done
+		_ask "Number or version [$_default]:" "$_default"
 		if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 1 && REPLY <= ${#_choices[@]} )); then
 			_version="${_choices[$((REPLY - 1))]%% *}"
 		else
@@ -196,7 +201,7 @@ _globalize() { sed -E 's/^declare -- /declare -g /; t; s/^declare -([a-zA-Z]+) /
 } | _globalize > .lunar-build.cfg
 
 _l_msg "linux-$_pkgsuffix $_kver"
-_l_msg2 "compiler $_compiler, LTO $_lto_mode, -march=$_march, ${_timer_freq} Hz, preempt $_preempt, ticks $_tickless"
+_l_msg2 "compiler $_compiler, LTO $_lto_mode, -march=$_march, ${_timer_freq} Hz, preempt $_preempt, ticks $_tickless, governor $_cpu_governor"
 _l_msg2 "THP $_thp_enabled/$_thp_defrag, MGLRU $_mglru"
 _l_msg2 "defaults: defrag_mode=${_default_defrag_mode:-kernel} scale=${_default_watermark_scale_factor:-kernel} boost=${_default_watermark_boost_factor:-kernel} proactiveness=${_default_compaction_proactiveness:-kernel} swappiness=${_default_swappiness:-kernel} ttm.low_latency=${_default_ttm_low_latency}"
 _l_msg2 "lunar patches: ${#_lunar_patches[@]}, user patches: $(( ${#_lunar_userreverts[@]} + ${#_lunar_userpatches[@]} ))"

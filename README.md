@@ -32,7 +32,8 @@ For PGP-verified stable tarballs, import the kernel.org keys once:
 ## Kernel versions
 
 `_version="7.3"` builds the newest 7.3.x, `"7.3.1"` exactly that release,
-`"7.4-rc1"` a release candidate, `""` asks. Patch sets exist for:
+`"7.4-rc1"` a release candidate, `""` asks (Enter picks the newest stable
+release, not a release candidate). Patch sets exist for:
 
 | Series | Based on | Status |
 | --- | --- | --- |
@@ -80,7 +81,8 @@ every run (proactive compaction migrates page-cache pages that are being read);
 50 kept most of the THP benefit without them.
 
 Build defaults: GCC, `-march=native`, 1000 Hz, `PREEMPT` (full) with
-PREEMPT_DYNAMIC, periodic tick, THP `always`, MGLRU on.
+PREEMPT_DYNAMIC, periodic tick, `performance` CPU governor, THP `always`,
+MGLRU on.
 
 ## Other options
 
@@ -88,7 +90,8 @@ Base config (Arch, CachyOS, running kernel, file), `localmodconfig` with
 modprobed-db, menuconfig/nconfig/xconfig, GCC or LLVM with Thin/Full LTO,
 `-march` (native, generic, x86-64-v3, znver4, ...), extra KCFLAGS, timer
 frequency, preemption (lazy/full/rt) and PREEMPT_DYNAMIC, tick mode, NR_CPUS,
-THP, MGLRU, headers package. See the comments in `customization.cfg`.
+default CPU governor (performance/schedutil/powersave), THP, MGLRU, headers
+package. See the comments in `customization.cfg`.
 
 ## Interrupting and cleaning up
 
@@ -127,14 +130,11 @@ build.
 the fragmenting setup it stays idle for `<sec>` seconds, then touches one THP
 burst and reports how many 2 MiB chunks got a huge page.
 
-## devguard
+## LunarDeviceGuard
 
-[`devguard/`](devguard/) is a separate, kernel-independent service that keeps
-one misbehaving device from stalling the whole system: it moves a storming IRQ
-to a housekeeping CPU, turns off ASPM / masks correctable AER errors on a
-flooding PCIe link, disables a USB port stuck in a reconnect loop and quiets
-the console during a kernel log flood. It starts in observe mode (log only);
-see [devguard/README.md](devguard/README.md).
+Containing misbehaving devices (IRQ storms, PCIe error floods, USB reconnect
+loops) and catching short freezes is a separate, kernel-independent project:
+[LunarDeviceGuard](https://github.com/WhitePeace36/LunarDeviceGuard).
 
 ## Test status
 
@@ -159,8 +159,6 @@ see [devguard/README.md](devguard/README.md).
   behaviour) and 26-34 ms with 20; `compact_memory` (a caller that must
   wait) still waited and the stuck CPU was logged; with the fair server at
   its default, both settings behaved the same. No lockdep reports.
-- devguard: 38 fixture checks (simulated IRQ storms, AER floods, USB loops,
-  log floods) and a live kernel-log flood; not yet on real faulty hardware.
 - Not tested yet: a full Arch/CachyOS config build of linux-lunar on real
   hardware, LLVM/LTO, PREEMPT_RT, NVIDIA DKMS against the headers package.
   One machine is not a benchmark.
