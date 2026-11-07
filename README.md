@@ -120,6 +120,7 @@ build.
 | `memstall.bt` | bpftrace: every direct reclaim / compaction stall > 1 ms with process and order |
 | `fragwatch.sh` | live fragmentation score, free 2 MiB blocks, kswapd state, compaction migrations and THP success per second |
 | `devwatch.sh` | find a misbehaving device: PSI irq/cpu/io/mem, busiest IRQ lines, busiest disks (busy %, wait, stuck requests), tasks blocked in D state with their kernel stack, new PCIe AER errors per device, busiest kernel threads, new kernel errors and USB disconnects (`sudo ./devwatch.sh 1`) |
+| `ipiwho.sh` | which kernel functions CPUs send each other (the `CAL` interrupts), from where and for which task, recorded for a few seconds via the `csd:csd_queue_cpu` tracepoint (`sudo ./ipiwho.sh 5`) |
 | `draintest.c` | reproduce the stall patch 0006 fixes: an RT task on one CPU keeps that CPU's LRU cache full while `drop_caches` / `compact_memory` wait for it (`gcc -O2 -o tools/draintest tools/draintest.c`) |
 
 `memstress -q <sec> -B <MiB> -t 0` tests proactive compaction on its own: after
