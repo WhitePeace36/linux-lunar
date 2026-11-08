@@ -99,9 +99,12 @@ Ctrl+C, closing the terminal, or `kill` stops every build
 process (makepkg, make, compilers) and removes `src/`, `pkg/` and partial
 downloads (`_cleanup_on_abort`; set it to `"false"` to keep `src/` for
 debugging). A failed build is cleaned up the same way. After a successful build
-`src/` and `pkg/` are removed too (`_cleanup_after_build`); the packages and the
-downloaded kernel tarball are kept. A running `pacman` installation is never
-interrupted. `./lunar.sh --clean` removes everything including packages.
+`src/` and `pkg/` are removed too (`_cleanup_after_build`); the packages are
+kept. The kernel tarball and its signature are downloaded to `sources/`; after a
+build only those of the version just built stay there, so a rebuild skips the
+download (`_keep_kernel_source="false"` removes `sources/` as well). A running
+`pacman` installation is never interrupted. `./lunar.sh --clean` removes
+everything: `src/`, `pkg/`, `sources/`, packages and cached downloads.
 
 ## Your own patches
 

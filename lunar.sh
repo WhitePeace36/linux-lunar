@@ -16,10 +16,13 @@ source "$_where/lunar-config/lib.sh"
 
 # ------------------------------------------------------------ cleanup -------
 
+# Kernel tarball and signature are downloaded to sources/ (makepkg SRCDEST).
+_lunar_srcdest="$_where/sources"
+
 # Remove what an interrupted or failed run leaves behind. Finished packages
 # and a completely downloaded kernel tarball are kept.
 _lunar_cleanup_abort() {
-	rm -f .lunar-base.config.tmp .lunar-releases.json.tmp ./*.part
+	rm -f .lunar-base.config.tmp .lunar-releases.json.tmp ./*.part "$_lunar_srcdest"/*.part
 	if _l_true "${_cleanup_on_abort:-true}"; then
 		rm -rf src pkg .lunar-build.cfg
 		_l_msg2 "Removed src/, pkg/ and partial downloads"
@@ -82,8 +85,8 @@ while (( $# )); do
 done
 
 if [[ "$_mode" == clean ]]; then
-	rm -rf src pkg ./*.pkg.tar.* ./*.part .lunar-build.cfg .lunar-base.config .lunar-base.config.tmp \
-		.lunar-releases.json .lunar-releases.json.tmp
+	rm -rf src pkg sources ./*.pkg.tar.* ./*.part ./linux-*.tar.xz ./linux-*.tar.gz ./linux-*.tar.sign \
+		.lunar-build.cfg .lunar-base.config .lunar-base.config.tmp .lunar-releases.json .lunar-releases.json.tmp
 	_l_msg "Cleaned"
 	exit 0
 fi
@@ -208,6 +211,13 @@ _l_msg2 "lunar patches: ${#_lunar_patches[@]}, user patches: $(( ${#_lunar_userr
 
 # ------------------------------------------------------------ makepkg -------
 
+mkdir -p "$_lunar_srcdest"
+# earlier linux-lunar versions downloaded next to lunar.sh: move, don't re-download
+for _f in ./linux-*.tar.xz ./linux-*.tar.gz ./linux-*.tar.sign; do
+	[[ -e "$_f" ]] && mv -f "$_f" "$_lunar_srcdest/"
+done
+export SRCDEST="$_lunar_srcdest"
+
 _mk=(makepkg --cleanbuild --syncdeps)
 _l_true "$_pgp_verify" || _mk+=(--skippgpcheck)
 case "$_mode" in
@@ -235,5 +245,17 @@ fi
 if [[ "$_mode" != prepare ]] && _l_true "$_cleanup_after_build"; then
 	rm -rf src pkg ./*.part
 	_l_msg2 "Removed src/ and pkg/ (packages kept: $(echo ./*.pkg.tar.* | tr ' ' '\n' | sed 's|^\./||' | paste -sd ' '))"
+fi
+if [[ "$_mode" != prepare ]]; then
+	if _l_true "${_keep_kernel_source:-true}"; then
+		# keep only what the version just built needs
+		for _f in "$_lunar_srcdest"/*; do
+			[[ -e "$_f" && "${_f##*/}" != "$_srcname".tar.* ]] && rm -f "$_f"
+		done
+		_l_msg2 "Kept $(cd "$_lunar_srcdest" && echo "$_srcname".tar.* | sed 's/ /, /g') in sources/ for rebuilds"
+	else
+		rm -rf "$_lunar_srcdest"
+		_l_msg2 "Removed sources/ (_keep_kernel_source=false)"
+	fi
 fi
 _l_msg "Done"

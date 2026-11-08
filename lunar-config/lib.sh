@@ -27,7 +27,7 @@ _LUNAR_OPTIONS=(
 	_default_watermark_boost_factor _default_compaction_proactiveness
 	_default_swappiness _default_ttm_low_latency _default_lru_drain_timeout_ms
 	_user_patches _user_patches_confirm _build_headers _noninteractive
-	_cleanup_on_abort _cleanup_after_build
+	_cleanup_on_abort _cleanup_after_build _keep_kernel_source
 )
 
 # Load customization.cfg, then the personal override file.

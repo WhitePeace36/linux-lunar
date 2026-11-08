@@ -2,6 +2,7 @@ src/
 pkg/
 *.pkg.tar.*
 linux-*.tar.*
+sources/
 .lunar-build.cfg
 .lunar-base.config
 .lunar-releases.json*
