@@ -29,21 +29,6 @@ For PGP-verified stable tarballs, import the kernel.org keys once:
 `gpg --locate-keys torvalds@kernel.org gregkh@kernel.org`
 (or set `_pgp_verify="false"`).
 
-## Kernel versions
-
-`_version="7.3"` builds the newest 7.3.x, `"7.3.1"` exactly that release,
-`"7.4-rc1"` a release candidate, `""` asks (Enter picks the newest stable
-release, not a release candidate). Patch sets exist for:
-
-| Series | Based on | Status |
-| --- | --- | --- |
-| 7.3 | 7.3.1 | 0001-0005 booted and load-tested on one machine, 0006 tested in QEMU (see below) |
-| 7.4 | 7.4-rc1 | 0001-0005 compile-tested only, 0006 tested in QEMU |
-
-A newer point release of the same series (e.g. 7.3.2) usually applies
-unchanged. If a patch stops applying, the build stops with an error instead of
-continuing without it.
-
 ## The lunar patches
 
 Each can be switched off in `customization.cfg`.
@@ -52,8 +37,8 @@ Each can be switched off in `customization.cfg`.
 | --- | --- | --- |
 | 0001 | `_patch_filemap_large_folios` | Page-cache folios larger than 32 KiB are allocated without direct reclaim/compaction; kswapd/kcompactd are woken instead and readahead steps down one order at a time. Removes compaction stalls when games stream assets. |
 | 0002 | `_patch_boost_min_wmark` | `watermark_boost_factor` no longer raises the **min** watermark, so a fragmentation event cannot push allocations into direct reclaim. |
-| 0003 | `_patch_ttm_low_latency` | `ttm.low_latency_alloc`: GPU buffer allocations (amdgpu and other TTM drivers) do one bounded reclaim/compaction round for 2 MiB pages instead of retrying hard. |
-| 0004 | `_patch_soft_defrag_mode` | `vm.defrag_mode=2`: kswapd/kcompactd keep whole free 2 MiB blocks like mode 1, but allocations never stall just to avoid a migratetype fallback. |
+| 0003 | `_patch_ttm_low_latency` | `ttm.low_latency_alloc`: how hard GPU buffer allocations (amdgpu, xe and other TTM drivers) work for 2 MiB pages. 0 = retry hard (upstream), 1 = one bounded reclaim/compaction round, 2 = no reclaim/compaction in the calling thread, only kswapd is woken. Every level falls back to smaller pages. |
+| 0004 | `_patch_soft_defrag_mode` | `vm.defrag_mode=2`: kswapd/kcompactd keep whole free 2 MiB blocks like mode 1, but allocations never stall just to avoid a migratetype fallback. Opportunistic attempts that can't reclaim at all (SLUB's larger slabs, ...) don't fall back either; they retry smaller, as in mode 1, so they can't fragment the free blocks. |
 | 0005 | `_patch_kswapd_hopeless` | A kswapd that gave up ("hopeless") is revived by its own or by global direct-reclaim progress again, not only once free memory is back above the high watermark. |
 | 0006 | `_patch_lru_drain_bounded` | `vm.lru_drain_timeout_ms`: khugepaged, MADV_COLLAPSE, `fadvise(DONTNEED)`, KSM, `memory.reclaim` and `drop_caches` stop waiting after 20 ms for a CPU that can't run its LRU drain work (interrupt storm, stuck driver, ...), instead of stalling, and everyone queued behind them with it. Callers that need the drain (migration, GUP pins, ...) still wait, but the kernel log now names the stuck CPU after 1 s. Counters: `lru_drain_timeout`, `lru_drain_slow` in `/proc/vmstat`. |
 
@@ -68,7 +53,7 @@ Set in `customization.cfg`, all still changeable at runtime:
 | `vm.watermark_boost_factor` | 600 | 15000 |
 | `vm.compaction_proactiveness` | 50 | 20 |
 | `vm.swappiness` | 150 | 60 |
-| `ttm.low_latency_alloc` | Y | N |
+| `ttm.low_latency_alloc` | 1 | 0 |
 | `vm.lru_drain_timeout_ms` | 20 | (patch 0006 only) |
 | THP enabled / defrag | always / defer | Kconfig / madvise |
 
@@ -138,33 +123,6 @@ burst and reports how many 2 MiB chunks got a huge page.
 Containing misbehaving devices (IRQ storms, PCIe error floods, USB reconnect
 loops) and catching short freezes is a separate, kernel-independent project:
 [LunarDeviceGuard](https://github.com/WhitePeace36/LunarDeviceGuard).
-
-## Test status
-
-- All patches apply and compile with `W=1` on 7.3.1 and 7.4-rc1 (GCC, x86_64,
-  THP, MEMCG, MGLRU).
-- linux-lunar itself: `./lunar.sh --build-only` ran end to end for 7.3.1
-  (reduced x86_64 config, GCC) and produced `linux-lunar` and
-  `linux-lunar-headers`. The kernel booted in QEMU with all compiled-in
-  defaults active (`vm.defrag_mode=2`, `watermark_scale_factor=500`, boost 600,
-  proactiveness 80 at the time, swappiness 150, THP `always`/`defer`, MGLRU on) and
-  rejected `defrag_mode=3`. Interrupting with SIGINT (Ctrl+C) and SIGTERM
-  during compilation stopped all build processes within about 15 s and left no
-  `src/`, `pkg/` or build processes behind.
-- The 7.3 patches were booted and load-tested on one gaming PC (32 GiB, zram
-  16 GiB, CachyOS) inside a linux-tkg build with Zen's kswapd early-stop patch
-  reverted. `memstress -a 16`, 120 s: `allocstall` 819,999 → about 1,500,
-  `compact_stall` 11,290 → 0-78, THP fallbacks 99.9 % → 0.06-0.3 %,
-  PSI memory 26.6 s → 1-2.4 s.
-- Patch 0006 on 7.3.1 and 7.4-rc1 in QEMU (2 vCPUs, PROVE_LOCKING), with a
-  SCHED_FIFO task faulting in pages on CPU 1 and CPU 1's fair server off:
-  `drop_caches` waited 4.97-5.06 s with `lru_drain_timeout_ms=0` (old
-  behaviour) and 26-34 ms with 20; `compact_memory` (a caller that must
-  wait) still waited and the stuck CPU was logged; with the fair server at
-  its default, both settings behaved the same. No lockdep reports.
-- Not tested yet: a full Arch/CachyOS config build of linux-lunar on real
-  hardware, LLVM/LTO, PREEMPT_RT, NVIDIA DKMS against the headers package.
-  One machine is not a benchmark.
 
 ## Origin
 

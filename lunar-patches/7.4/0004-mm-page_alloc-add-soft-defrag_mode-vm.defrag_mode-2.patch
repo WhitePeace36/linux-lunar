@@ -1,7 +1,7 @@
-From bde2e4f823fec3097517b557f10fe868629ec7a8 Mon Sep 17 00:00:00 2001
+From f3d4af18c819560e32dd8b265ca14c667b5d741c Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 19:01:36 +0100
-Subject: [PATCH 4/5] mm/page_alloc: add soft defrag_mode (vm.defrag_mode=2)
+Subject: [PATCH 4/6] mm/page_alloc: add soft defrag_mode (vm.defrag_mode=2)
 
 defrag_mode=1 makes kswapd and kcompactd keep the watermarks met in
 whole free pageblocks, which gives a reserve of blocks for THP and
@@ -10,9 +10,9 @@ the allocator until direct reclaim and compaction have failed. For
 unmovable requests the reclaim/compaction order is promoted to
 pageblock_order, and should_reclaim_retry() lets promoted requests loop
 up to MAX_RECLAIM_RETRIES times. An order-0 slab or page table
-allocation can therefore run several rounds of direct reclaim and
-pageblock-order compaction while plenty of memory is free, which shows
-up as more allocstall/compact_stall events than with defrag_mode=0.
+allocation can therefore run several rounds of direct reclaim and pageblock-order compaction while plenty of memory is free,
+which shows up as more allocstall/compact_stall events than with
+defrag_mode=0.
 
 Add a soft mode. With vm.defrag_mode=2 the background behaviour is
 identical to mode 1: kswapd is woken at pageblock order, balances on
@@ -23,24 +23,31 @@ if that fails the fallback is allowed immediately instead of entering
 reclaim/compaction for it. Direct reclaim and compaction then only run
 when memory is actually short, as in mode 0.
 
+Requests that may neither reclaim nor wake kswapd are left as in mode
+1. They are opportunistic higher-order attempts (SLUB's higher slab
+orders, TTM's non-beneficial orders) that cannot stall and retry with
+a smaller order; letting them fall back would only place unmovable
+pages in movable pageblocks without waking anything to repair it.
+
 Fallbacks taken in soft mode can be observed with the
 mm_page_alloc_extfrag tracepoint.
 
-DRAFT, untested at runtime; compile-tested only (x86_64 defconfig + THP).
+DRAFT for linux-lunar; not submitted upstream. Test status: see
+the linux-lunar README.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
 ---
- Documentation/admin-guide/sysctl/vm.rst | 12 ++++++++++++
+ Documentation/admin-guide/sysctl/vm.rst | 15 ++++++++++++++
  mm/internal.h                           |  5 +++++
- mm/page_alloc.c                         | 18 +++++++++++++++++-
- 3 files changed, 34 insertions(+), 1 deletion(-)
+ mm/page_alloc.c                         | 27 ++++++++++++++++++++++++-
+ 3 files changed, 46 insertions(+), 1 deletion(-)
 
 diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
-index 3cb0138e8..a17e70f74 100644
+index 3cb0138e8..e84c135f6 100644
 --- a/Documentation/admin-guide/sysctl/vm.rst
 +++ b/Documentation/admin-guide/sysctl/vm.rst
-@@ -156,6 +156,18 @@ defrag_mode
+@@ -156,6 +156,21 @@ defrag_mode
  
  When set to 1, the page allocator tries harder to avoid fragmentation
  and maintain the ability to produce huge pages / higher-order pages.
@@ -52,18 +59,21 @@ index 3cb0138e8..a17e70f74 100644
 +
 +When set to 2 ("soft" mode), kswapd and kcompactd behave as with 1, but
 +an allocation that cannot be served without a fallback is allowed to
-+fall back as soon as kswapd has been woken, instead of reclaiming or
-+compacting for it. Direct reclaim and compaction then only happen when
-+memory is actually short, as with 0. This keeps a reserve of free
-+pageblocks for huge pages without adding foreground stalls.
++fall back right away (after waking kswapd, if it may), instead of
++reclaiming or compacting for it. Direct reclaim and compaction then only
++happen when memory is actually short, as with 0. Requests that may
++neither reclaim nor wake kswapd (opportunistic higher-order attempts,
++such as SLUB's) are not allowed to fall back and retry with a smaller
++order, as with 1. This keeps a reserve of free pageblocks for huge pages
++without adding foreground stalls.
  
  It is recommended to enable this right after boot, as fragmentation,
  once it occurred, can be long-lasting or even permanent.
 diff --git a/mm/internal.h b/mm/internal.h
-index 95b1c2756..a1b6af0da 100644
+index 679ce14c8..373128260 100644
 --- a/mm/internal.h
 +++ b/mm/internal.h
-@@ -742,6 +742,11 @@ extern char * const zone_names[MAX_NR_ZONES];
+@@ -750,6 +750,11 @@ extern char * const zone_names[MAX_NR_ZONES];
  extern int min_free_kbytes;
  extern int defrag_mode;
  
@@ -76,10 +86,10 @@ index 95b1c2756..a1b6af0da 100644
  void calculate_min_free_kbytes(void);
  int __meminit init_per_zone_wmark_min(void);
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index 3aea974df..474e02e86 100644
+index 3aea974df..5f92a1347 100644
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
-@@ -4872,6 +4872,22 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+@@ -4872,6 +4872,31 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
  	if (page)
  		goto got_pg;
  
@@ -90,9 +100,18 @@ index 3aea974df..474e02e86 100644
 +	 * compact merely to avoid a migratetype fallback; allow the fallback
 +	 * now and only enter reclaim/compaction if memory is really short.
 +	 * The flag stays cleared for the retry loop below.
++	 *
++	 * Requests that may neither reclaim nor wake kswapd are excluded.
++	 * They are opportunistic attempts (SLUB's higher slab orders, TTM's
++	 * non-beneficial orders, ...) that cannot stall anyway and retry
++	 * with a smaller order themselves. Letting them fall back would put
++	 * unmovable pages into movable pageblocks with nothing woken to
++	 * repair it, and those blocks are then lost to compaction for good.
++	 * As in strict mode, they fail below (!can_direct_reclaim).
 +	 */
 +	if (defrag_mode == DEFRAG_MODE_SOFT &&
-+	    (alloc_flags & ALLOC_NOFRAGMENT)) {
++	    (alloc_flags & ALLOC_NOFRAGMENT) &&
++	    (gfp_mask & __GFP_RECLAIM)) {
 +		alloc_flags &= ~ALLOC_NOFRAGMENT;
 +		page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
 +		if (page)
@@ -102,7 +121,7 @@ index 3aea974df..474e02e86 100644
  	reserve_flags = __gfp_pfmemalloc_flags(gfp_mask);
  	if (reserve_flags)
  		alloc_flags = alloc_flags_cma(gfp_mask) | reserve_flags |
-@@ -6959,7 +6975,7 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
+@@ -6959,7 +6984,7 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
  		.mode		= 0644,
  		.proc_handler	= proc_dointvec_minmax,
  		.extra1		= SYSCTL_ZERO,

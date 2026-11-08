@@ -1,8 +1,8 @@
-From 23556a5d724d38fca0f6e22f98fd456b93fc6343 Mon Sep 17 00:00:00 2001
+From a0cf3322f5e2fecd5f99496036135550b8b5c792 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Sat, 7 Nov 2026 16:52:27 +0100
-Subject: [PATCH] mm/folio: don't let one unresponsive CPU stall best-effort
- LRU drains
+Subject: [PATCH 6/6] mm/folio: don't let one unresponsive CPU stall
+ best-effort LRU drains
 
 lru_add_drain_all() queues a work item on every CPU whose per-CPU LRU
 caches are not empty and then flush_work()s each of them, all under a
@@ -33,7 +33,9 @@ To make that possible:
    completed", so the early exit at (C) now checks a separate
    lru_drain_completed generation;
  - the work items are initialised once instead of on every round, as
-   one left pending by a bounded drain must not be re-initialised.
+   one left pending by a bounded drain must not be re-initialised;
+ - waiters are only woken when somebody waits (wq_has_sleeper()),
+   since every per-CPU drain work does it.
 
 Tested in QEMU (2 vCPUs, 7.3.1 with PROVE_LOCKING), with a SCHED_FIFO
 task faulting in pages on CPU1 and CPU1's fair server set to 0:
@@ -54,15 +56,15 @@ Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
  include/linux/swap.h                    |   1 +
  include/linux/vm_event_item.h           |   1 +
  mm/fadvise.c                            |   2 +-
- mm/folio.c                              | 253 +++++++++++++++++++++---
+ mm/folio.c                              | 266 +++++++++++++++++++++---
  mm/khugepaged.c                         |   4 +-
  mm/ksm.c                                |   2 +-
  mm/vmscan.c                             |   2 +-
  mm/vmstat.c                             |   2 +
- 10 files changed, 257 insertions(+), 36 deletions(-)
+ 10 files changed, 270 insertions(+), 36 deletions(-)
 
 diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
-index ede120e9d..1a5252165 100644
+index fe15cb1a8..09c9ee05d 100644
 --- a/Documentation/admin-guide/sysctl/vm.rst
 +++ b/Documentation/admin-guide/sysctl/vm.rst
 @@ -40,6 +40,7 @@ Currently, these files are in /proc/sys/vm:
@@ -73,7 +75,7 @@ index ede120e9d..1a5252165 100644
  - max_map_count
  - mem_profiling         (only if CONFIG_MEM_ALLOC_PROFILING=y)
  - memory_failure_early_kill
-@@ -470,6 +471,29 @@ The minimum value is 1 (1/1 -> 100%). The value less than 1 completely
+@@ -473,6 +474,29 @@ The minimum value is 1 (1/1 -> 100%). The value less than 1 completely
  disables protection of the pages.
  
  
@@ -154,7 +156,7 @@ index b63fe2141..807b48505 100644
  						end_index);
  			}
 diff --git a/mm/folio.c b/mm/folio.c
-index 50a6dbe55..fa645eaf1 100644
+index 50a6dbe55..468ee3e6d 100644
 --- a/mm/folio.c
 +++ b/mm/folio.c
 @@ -34,6 +34,7 @@
@@ -165,7 +167,7 @@ index 50a6dbe55..fa645eaf1 100644
  
  #include "internal.h"
  #include "page_alloc.h"
-@@ -746,11 +747,66 @@ void lru_add_drain_cpu_zone(struct zone *zone)
+@@ -746,11 +747,79 @@ void lru_add_drain_cpu_zone(struct zone *zone)
  
  #ifdef CONFIG_SMP
  
@@ -201,7 +203,8 @@ index 50a6dbe55..fa645eaf1 100644
 +static unsigned int lru_drain_completed;
 +static DEFINE_MUTEX(lru_drain_lock);
 +static DECLARE_WAIT_QUEUE_HEAD(lru_drain_wq);
-+
+ 
+-static void lru_add_drain_per_cpu(struct work_struct *dummy)
 +/*
 + * How long lru_add_drain_all_bounded() may wait, in total, for the drain
 + * mutex and for the per-CPU drain works. 0 makes it behave exactly like
@@ -211,10 +214,22 @@ index 50a6dbe55..fa645eaf1 100644
 +
 +/* After this long, a strict drain reports which CPUs it is waiting for. */
 +#define LRU_DRAIN_WARN_MS	1000
- 
--static void lru_add_drain_per_cpu(struct work_struct *dummy)
-+static void lru_add_drain_per_cpu(struct work_struct *work)
++
++/*
++ * Wake drain waiters, if there are any. Every per-CPU drain work calls
++ * this, so skip the wait queue lock when nobody waits. wq_has_sleeper()
++ * contains the full barrier that orders the caller's preceding store
++ * (done_gen, or the mutex release) before the check; it pairs with the
++ * barrier in prepare_to_wait() in wait_event_timeout().
++ */
++static void lru_drain_wake(void)
  {
++	if (wq_has_sleeper(&lru_drain_wq))
++		wake_up_all(&lru_drain_wq);
++}
++
++static void lru_add_drain_per_cpu(struct work_struct *work)
++{
 +	struct lru_drain_work *dw = container_of(work, struct lru_drain_work,
 +						 work);
 +	/*
@@ -230,11 +245,11 @@ index 50a6dbe55..fa645eaf1 100644
 +
 +	/* Pairs with smp_load_acquire() in lru_drain_cpus_done(). */
 +	smp_store_release(&dw->done_gen, gen);
-+	wake_up_all(&lru_drain_wq);
++	lru_drain_wake();
  }
  
  static bool cpu_needs_drain(unsigned int cpu)
-@@ -768,36 +824,83 @@ static bool cpu_needs_drain(unsigned int cpu)
+@@ -768,36 +837,83 @@ static bool cpu_needs_drain(unsigned int cpu)
  		has_bh_in_lru(cpu, NULL);
  }
  
@@ -286,7 +301,7 @@ index 50a6dbe55..fa645eaf1 100644
 +static void lru_drain_unlock(void)
 +{
 +	mutex_unlock(&lru_drain_lock);
-+	wake_up_all(&lru_drain_wq);
++	lru_drain_wake();
 +}
 +
  /*
@@ -333,7 +348,7 @@ index 50a6dbe55..fa645eaf1 100644
  
  	trace_mm_lru_add_drain_all_tp(force_all_cpus);
  
-@@ -820,14 +923,23 @@ static inline void __lru_add_drain_all(bool force_all_cpus)
+@@ -820,14 +936,23 @@ static inline void __lru_add_drain_all(bool force_all_cpus)
  	/* It helps everyone if we do our own local drain immediately. */
  	lru_add_drain();
  
@@ -361,7 +376,7 @@ index 50a6dbe55..fa645eaf1 100644
  
  	/*
  	 * (D) Increment global generation number
-@@ -850,36 +962,117 @@ static inline void __lru_add_drain_all(bool force_all_cpus)
+@@ -850,36 +975,117 @@ static inline void __lru_add_drain_all(bool force_all_cpus)
  	 * loop, CPU #x will just exit at (C) and miss flushing out all of its
  	 * added pages.
  	 */
@@ -453,7 +468,7 @@ index 50a6dbe55..fa645eaf1 100644
 +	unsigned int ms = READ_ONCE(sysctl_lru_drain_timeout_ms);
 +
 +	return __lru_add_drain_all(false, ms ? max(msecs_to_jiffies(ms), 1UL) : 0);
-+}
+ }
 +
 +static const struct ctl_table lru_drain_sysctl_table[] = {
 +	{
@@ -471,7 +486,7 @@ index 50a6dbe55..fa645eaf1 100644
 +{
 +	register_sysctl_init("vm", lru_drain_sysctl_table);
 +	return 0;
- }
++}
 +subsys_initcall(lru_drain_sysctl_init);
  #else
  void lru_add_drain_all(void)
@@ -487,7 +502,7 @@ index 50a6dbe55..fa645eaf1 100644
  #endif /* CONFIG_SMP */
  
  /**
-@@ -957,7 +1150,7 @@ void lru_cache_disable(void)
+@@ -957,7 +1163,7 @@ void lru_cache_disable(void)
  	 */
  	synchronize_rcu_expedited();
  #ifdef CONFIG_SMP
@@ -497,10 +512,10 @@ index 50a6dbe55..fa645eaf1 100644
  	lru_add_and_bh_lrus_drain();
  #endif
 diff --git a/mm/khugepaged.c b/mm/khugepaged.c
-index 75639298e..f01ac62b7 100644
+index 792166950..d34c4e7ab 100644
 --- a/mm/khugepaged.c
 +++ b/mm/khugepaged.c
-@@ -2975,7 +2975,7 @@ static void khugepaged_do_scan(struct collapse_control *cc)
+@@ -2990,7 +2990,7 @@ static void khugepaged_do_scan(struct collapse_control *cc)
  	bool wait = true;
  	enum scan_result result = SCAN_SUCCEED;
  
@@ -509,7 +524,7 @@ index 75639298e..f01ac62b7 100644
  
  	cc->progress = 0;
  	while (true) {
-@@ -3208,7 +3208,7 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
+@@ -3223,7 +3223,7 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
  	cc->progress = 0;
  
  	mmgrab(mm);
@@ -532,10 +547,10 @@ index 49d48d1e0..a8189c912 100644
  		/*
  		 * Whereas stale stable_nodes on the stable_tree itself
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 04d2fa6c4..0e972b30e 100644
+index 870341145..f420fd248 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
-@@ -8047,7 +8047,7 @@ int user_proactive_reclaim(char *buf,
+@@ -8054,7 +8054,7 @@ int user_proactive_reclaim(char *buf,
  		 * hope of introducing more evictable pages.
  		 */
  		if (!nr_retries)

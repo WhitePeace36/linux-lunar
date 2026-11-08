@@ -83,8 +83,16 @@ lunar_validate_options() {
 		|| _l_die "_default_compaction_proactiveness must be 0..100"
 	[[ -z "$_default_swappiness" ]] || _l_int_range "$_default_swappiness" 0 200 \
 		|| _l_die "_default_swappiness must be 0..200"
-	if _l_true "$_default_ttm_low_latency" && ! _l_true "$_patch_ttm_low_latency"; then
-		_l_die "_default_ttm_low_latency=true needs _patch_ttm_low_latency=true"
+	case "${_default_ttm_low_latency,,}" in   # true/false from older configs
+		true|yes)  _default_ttm_low_latency=1 ;;
+		false|no)  _default_ttm_low_latency=0 ;;
+	esac
+	if [[ -n "$_default_ttm_low_latency" ]]; then
+		_l_int_range "$_default_ttm_low_latency" 0 2 \
+			|| _l_die "_default_ttm_low_latency must be 0, 1 or 2 (or empty)"
+		if (( _default_ttm_low_latency > 0 )) && ! _l_true "$_patch_ttm_low_latency"; then
+			_l_die "_default_ttm_low_latency=$_default_ttm_low_latency needs _patch_ttm_low_latency=true"
+		fi
 	fi
 	if [[ -n "$_default_lru_drain_timeout_ms" ]]; then
 		_l_int_range "$_default_lru_drain_timeout_ms" 0 1000 \
@@ -263,10 +271,10 @@ lunar_set_defaults() {
 		_l_msg2 "vm.swappiness = $_default_swappiness"
 		_l_set_line mm/vmscan.c '^int vm_swappiness = [0-9]+;$' "int vm_swappiness = $_default_swappiness;"
 	fi
-	if _l_true "$_default_ttm_low_latency"; then
-		_l_msg2 "ttm.low_latency_alloc = Y"
-		_l_set_line drivers/gpu/drm/ttm/ttm_pool.c '^static bool ttm_pool_low_latency;$' \
-			'static bool ttm_pool_low_latency = true;'
+	if [[ -n "$_default_ttm_low_latency" ]] && (( _default_ttm_low_latency > 0 )); then
+		_l_msg2 "ttm.low_latency_alloc = $_default_ttm_low_latency"
+		_l_set_line drivers/gpu/drm/ttm/ttm_pool.c '^static unsigned int ttm_pool_low_latency;$' \
+			"static unsigned int ttm_pool_low_latency = $_default_ttm_low_latency;"
 	fi
 	if [[ -n "$_default_lru_drain_timeout_ms" ]]; then
 		_l_msg2 "vm.lru_drain_timeout_ms = $_default_lru_drain_timeout_ms"

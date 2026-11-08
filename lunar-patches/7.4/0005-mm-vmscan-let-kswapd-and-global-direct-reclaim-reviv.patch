@@ -1,7 +1,7 @@
-From 178985c1958b9dd0d14690857ce6c4f57e399c28 Mon Sep 17 00:00:00 2001
+From 5bb94f83dd791b27b5555b4972ac49abacf6bed4 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 22:40:29 +0100
-Subject: [PATCH 5/5] mm/vmscan: let kswapd and global direct reclaim revive a
+Subject: [PATCH 5/6] mm/vmscan: let kswapd and global direct reclaim revive a
  hopeless kswapd
 
 kswapd marks a node hopeless after MAX_RECLAIM_RETRIES runs that
@@ -28,21 +28,24 @@ file reads: node_unreclaimable stayed 1 before and throughout a
 Keep the balanced requirement for cgroup reclaim, but let progress made
 by kswapd itself or by global direct reclaim clear the hopeless state,
 as before. kswapd then again only gives up after consecutive failures.
+The counter is read before it is reset, so the frequent calls from
+direct reclaim don't keep writing to a cache line that every
+allocation slow path reads.
 
-DRAFT, untested at runtime; compile-tested only on v7.4-rc1
-(x86_64 defconfig + THP + MEMCG + LRU_GEN).
+DRAFT for linux-lunar; not submitted upstream. Test status: see
+the linux-lunar README.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
 ---
- mm/vmscan.c | 30 ++++++++++++++++++++++++++++--
- 1 file changed, 28 insertions(+), 2 deletions(-)
+ mm/vmscan.c | 37 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 2 deletions(-)
 
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 225b67aa6..cc1ddc68e 100644
+index 225b67aa6..1bcbe5016 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
-@@ -284,6 +284,32 @@ static bool writeback_throttling_sane(struct scan_control *sc)
+@@ -284,6 +284,39 @@ static bool writeback_throttling_sane(struct scan_control *sc)
  }
  #endif
  
@@ -67,15 +70,22 @@ index 225b67aa6..cc1ddc68e 100644
 +		kswapd_try_clear_hopeless(pgdat, sc->order, sc->reclaim_idx);
 +		return;
 +	}
-+	kswapd_clear_hopeless(pgdat, current_is_kswapd() ?
-+			      KSWAPD_CLEAR_HOPELESS_KSWAPD :
-+			      KSWAPD_CLEAR_HOPELESS_DIRECT);
++	/*
++	 * This runs after every reclaim pass that made progress, on every
++	 * CPU in direct reclaim. Read first: an unconditional atomic_xchg()
++	 * would keep bouncing a cache line that wakeup_kswapd() reads in
++	 * every allocation slow path, just when reclaim is busiest.
++	 */
++	if (atomic_read(&pgdat->kswapd_failures))
++		kswapd_clear_hopeless(pgdat, current_is_kswapd() ?
++				      KSWAPD_CLEAR_HOPELESS_KSWAPD :
++				      KSWAPD_CLEAR_HOPELESS_DIRECT);
 +}
 +
  static inline bool is_exec_file_folio(const struct folio *folio,
  		const vma_flags_t *vma_flags)
  {
-@@ -5466,7 +5492,7 @@ static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *
+@@ -5466,7 +5499,7 @@ static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *
  	blk_finish_plug(&plug);
  done:
  	if (sc->nr_reclaimed > reclaimed)
@@ -84,7 +94,7 @@ index 225b67aa6..cc1ddc68e 100644
  }
  
  /******************************************************************************
-@@ -6562,7 +6588,7 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -6562,7 +6595,7 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	 * successful direct reclaim run will revive a dormant kswapd.
  	 */
  	if (reclaimable)

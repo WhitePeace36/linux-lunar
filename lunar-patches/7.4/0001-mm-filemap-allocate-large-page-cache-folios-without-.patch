@@ -1,7 +1,7 @@
-From 0466e7b7bea0f123328bd4368b56676c05a17bf3 Mon Sep 17 00:00:00 2001
+From 71bf490f919561483f1120bc42492d5bef338f98 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 16:53:47 +0100
-Subject: [PATCH 1/5] mm/filemap: allocate large page cache folios without
+Subject: [PATCH 1/6] mm/filemap: allocate large page cache folios without
  direct reclaim/compaction
 
 Page cache readahead and __filemap_get_folio() allocate folios up to
@@ -19,19 +19,25 @@ are asked to produce blocks in the background, and fall back to smaller
 orders. Readahead now steps down one order on -ENOMEM instead of
 dropping the remainder of the window to the minimum order.
 
+Without __GFP_DIRECT_RECLAIM the allocator would treat these requests
+as non-blocking and let them dip into the high-order atomic reserve,
+which is meant for real atomic users. Add __GFP_NOMEMALLOC as well,
+as GFP_TRANSHUGE_LIGHT does.
+
 This targets streaming readers (e.g. games streaming assets from disk)
 that otherwise show compact_stall/allocstall spikes on fragmented
 systems even though order-0 memory is plentiful.
 
-DRAFT, untested at runtime; compile-tested only (x86_64 defconfig + THP).
+DRAFT for linux-lunar; not submitted upstream. Test status: see
+the linux-lunar README.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
 ---
  mm/filemap.c   |  7 +++++++
- mm/internal.h  | 17 +++++++++++++++++
+ mm/internal.h  | 25 +++++++++++++++++++++++++
  mm/readahead.c | 16 +++++++++++++++-
- 3 files changed, 39 insertions(+), 1 deletion(-)
+ 3 files changed, 47 insertions(+), 1 deletion(-)
 
 diff --git a/mm/filemap.c b/mm/filemap.c
 index b74bc1e50..511fcf7b6 100644
@@ -52,10 +58,10 @@ index b74bc1e50..511fcf7b6 100644
  			if (!folio)
  				continue;
 diff --git a/mm/internal.h b/mm/internal.h
-index 566cbd2dc..95b1c2756 100644
+index 566cbd2dc..679ce14c8 100644
 --- a/mm/internal.h
 +++ b/mm/internal.h
-@@ -696,6 +696,23 @@ extern unsigned long highest_memmap_pfn;
+@@ -696,6 +696,31 @@ extern unsigned long highest_memmap_pfn;
   */
  #define MAX_RECLAIM_RETRIES 16
  
@@ -66,13 +72,21 @@ index 566cbd2dc..95b1c2756 100644
 + * become available soon, but never make the reading/writing task stall in
 + * direct reclaim or direct compaction for them. Callers fall back to smaller
 + * orders, down to @min_order, which keeps the original gfp mask.
++ *
++ * Without __GFP_DIRECT_RECLAIM the allocator treats a request as
++ * non-blocking and lets it take pages from the high-order atomic reserve
++ * when the normal free lists fail. That reserve is meant for real atomic
++ * users (network drivers and the like), not for an optimisation that can
++ * simply fall back, so add __GFP_NOMEMALLOC as GFP_TRANSHUGE_LIGHT and
++ * SLUB's opportunistic high-order slabs do.
 + */
 +static inline gfp_t pagecache_large_folio_gfp(gfp_t gfp, unsigned int order,
 +					      unsigned int min_order)
 +{
 +	if (order > min_order && order > PAGE_ALLOC_COSTLY_ORDER &&
 +	    (gfp & __GFP_DIRECT_RECLAIM))
-+		gfp = (gfp & ~__GFP_DIRECT_RECLAIM) | __GFP_KSWAPD_RECLAIM;
++		gfp = (gfp & ~__GFP_DIRECT_RECLAIM) |
++		      __GFP_KSWAPD_RECLAIM | __GFP_NOMEMALLOC;
 +	return gfp;
 +}
 +
