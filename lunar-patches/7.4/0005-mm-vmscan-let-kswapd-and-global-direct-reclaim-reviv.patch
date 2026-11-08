@@ -1,7 +1,7 @@
 From 5bb94f83dd791b27b5555b4972ac49abacf6bed4 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 22:40:29 +0100
-Subject: [PATCH 5/6] mm/vmscan: let kswapd and global direct reclaim revive a
+Subject: [PATCH 5/7] mm/vmscan: let kswapd and global direct reclaim revive a
  hopeless kswapd
 
 kswapd marks a node hopeless after MAX_RECLAIM_RETRIES runs that

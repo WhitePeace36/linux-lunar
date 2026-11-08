@@ -1,0 +1,74 @@
+#!/usr/bin/env bpftrace
+/*
+ * stallwho.bt - which kernel waits stall a process, and who kept it waiting.
+ *
+ * Catches every time a thread of one process is blocked in the kernel
+ * (uninterruptible sleep, "D" state) for longer than a threshold. It prints
+ * where the thread was blocked and which task woke it up, with that task's
+ * kernel stack. That covers waits for locks (mmap_lock, page cache folio
+ * locks, inode locks, ...), for I/O and for memory reclaim.
+ *
+ * The waker is usually whoever held the lock or did the work. A background
+ * kernel thread there - khugepaged, kcompactd, kswapd, a kworker, jbd2,
+ * btrfs-* - means the process waited for background work. When the waker
+ * stack shows an interrupt handler (I/O completion), the waker name is just
+ * the task the interrupt happened to land on.
+ *
+ * Not shown: interruptible sleeps (futexes, poll, ...), which are the
+ * program's own waits, and time spent waiting for a CPU.
+ *
+ * Usage:  sudo bpftrace stallwho.bt <pid> [threshold_ms]     (default 2)
+ *         sudo bpftrace stallwho.bt $(pgrep -f Game.exe | head -1) 5
+ *         Ctrl-C prints a summary by waker.
+ */
+
+BEGIN
+{
+	if ($1 == 0) {
+		printf("usage: bpftrace stallwho.bt <pid> [threshold_ms]\n");
+		exit();
+	}
+	@thresh_us = (uint64)(($2 > 0 ? $2 : 2) * 1000);
+	printf("Tracing D-state waits of pid %d longer than %d ms. Ctrl-C to end.\n",
+	       $1, @thresh_us / 1000);
+}
+
+/* A thread of the target process goes to sleep uninterruptibly. */
+tracepoint:sched:sched_switch
+/pid == $1 && args->prev_state == 2/
+{
+	@since[tid] = nsecs;
+	@blocked[tid] = kstack(12);
+}
+
+/* Someone wakes it; this runs in the waker's context. */
+tracepoint:sched:sched_waking
+/@since[args->pid]/
+{
+	$us = (nsecs - @since[args->pid]) / 1000;
+	if ($us >= @thresh_us) {
+		time("%H:%M:%S ");
+		printf("%s (tid %d) blocked %d.%03d ms, woken by %s (pid %d)\n",
+		       args->comm, args->pid, $us / 1000, $us % 1000, comm, pid);
+		printf("  blocked in:%s", @blocked[args->pid]);
+		printf("  waker in:%s\n", kstack(12));
+		@stalls_by_waker[comm] = count();
+		@stall_ms_by_waker[comm] = hist($us / 1000);
+	}
+	delete(@since[args->pid]);
+	delete(@blocked[args->pid]);
+}
+
+tracepoint:sched:sched_process_exit
+/@since[tid]/
+{
+	delete(@since[tid]);
+	delete(@blocked[tid]);
+}
+
+END
+{
+	clear(@since);
+	clear(@blocked);
+	delete(@thresh_us);
+}

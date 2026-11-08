@@ -1,7 +1,7 @@
 From f3d4af18c819560e32dd8b265ca14c667b5d741c Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 19:01:36 +0100
-Subject: [PATCH 4/6] mm/page_alloc: add soft defrag_mode (vm.defrag_mode=2)
+Subject: [PATCH 4/7] mm/page_alloc: add soft defrag_mode (vm.defrag_mode=2)
 
 defrag_mode=1 makes kswapd and kcompactd keep the watermarks met in
 whole free pageblocks, which gives a reserve of blocks for THP and

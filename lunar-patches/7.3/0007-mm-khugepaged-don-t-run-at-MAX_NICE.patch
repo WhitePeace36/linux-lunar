@@ -1,0 +1,74 @@
+From e5031a7a6181d6e69e2eb5f27c7b15df1f5bc675 Mon Sep 17 00:00:00 2001
+From: "Claude (draft)" <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 15:50:00 +0100
+Subject: [PATCH 7/7] mm/khugepaged: don't run at MAX_NICE
+
+khugepaged runs at MAX_NICE so that it stays out of the way. But while
+it collapses a range it holds locks that the scanned process itself
+needs:
+
+ - collapse_huge_page(): the mmap_lock for read while revalidating and
+   swapping in, then for write together with the VMA write lock and
+   the anon_vma lock while it flushes, isolates and copies up to 2 MiB;
+ - collapse_file(): the page cache folios of the range, while it reads
+   missing pages and copies them into the new folio;
+ - collapse_scan_mm_slot(): the mmap_lock for read while scanning;
+ - with khugepaged/defrag=1, direct compaction during the allocation:
+   the folios it migrates stay locked and unmapped until they are moved.
+
+On a CPU that is busy with nice 0 work - a game, its shader compiler
+threads - a MAX_NICE task (weight 15 against 1024) can wait a long time
+before it runs again. If that happens while khugepaged holds one of
+these locks, or while it is queued for the mmap_lock as a writer (which
+already makes new readers wait), every thread of the process that calls
+mmap()/munmap()/mprotect(), faults on that VMA, on a mmap_lock fallback
+path or on a folio being migrated, or reads that file range, waits for
+the lowest priority thread on the system. Wine/Proton and game memory
+allocators call mmap()/mprotect() often.
+
+Run khugepaged at the default priority. Scanning and copying are cheap,
+and khugepaged sleeps between scans (scan_sleep_millisecs). With
+khugepaged/defrag=0 its allocation doesn't reclaim or compact either;
+with defrag=1 that work now competes at normal priority, which is the
+price for not holding migrating folios at MAX_NICE. Renicing khugepaged
+from userspace still works.
+
+DRAFT for linux-lunar; not submitted upstream. Not compiled or run yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Jpc2umnveVKWeq6gZjkGU7
+---
+ mm/khugepaged.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index d34c4e7ab..5a722bec9 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -3056,7 +3056,22 @@ static int khugepaged(void *none)
+ 	struct mm_slot *slot;
+ 
+ 	set_freezable();
+-	set_user_nice(current, MAX_NICE);
++	/*
++	 * No set_user_nice(current, MAX_NICE) here: a collapse takes locks
++	 * that the scanned process itself needs. Its mmap_lock (read while
++	 * scanning and swapping in, write while isolating and copying), the
++	 * VMA write lock and the anon_vma lock, or for file and shmem
++	 * collapse the page cache folios of the range. With khugepaged/defrag
++	 * the allocation also compacts, which locks and unmaps the folios it
++	 * migrates. At MAX_NICE on a busy CPU, khugepaged can wait a long time
++	 * to run again while holding any of these, or while queued for the
++	 * mmap_lock as a writer, which already blocks new readers. Every
++	 * thread that calls mmap()/munmap()/mprotect(), faults on that VMA, on
++	 * a mmap_lock fallback path or on a folio being migrated, or reads
++	 * that file range, then waits for the lowest priority thread on the
++	 * system. At the default priority this costs little: khugepaged
++	 * sleeps between scans, and a scan only walks page tables.
++	 */
+ 
+ 	while (!kthread_should_stop()) {
+ 		khugepaged_do_scan(&khugepaged_collapse_control);
+-- 
+2.43.0
+

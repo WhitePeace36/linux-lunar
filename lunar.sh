@@ -205,7 +205,7 @@ _globalize() { sed -E 's/^declare -- /declare -g /; t; s/^declare -([a-zA-Z]+) /
 
 _l_msg "linux-$_pkgsuffix $_kver"
 _l_msg2 "compiler $_compiler, LTO $_lto_mode, -march=$_march, ${_timer_freq} Hz, preempt $_preempt, ticks $_tickless, governor $_cpu_governor"
-_l_msg2 "THP $_thp_enabled/$_thp_defrag, MGLRU $_mglru"
+_l_msg2 "THP $_thp_enabled/$_thp_defrag, khugepaged defrag $_thp_khugepaged_defrag, alloc_sleep ${_thp_khugepaged_alloc_sleep_ms:-kernel} ms, MGLRU $_mglru"
 _l_msg2 "defaults: defrag_mode=${_default_defrag_mode:-kernel} scale=${_default_watermark_scale_factor:-kernel} boost=${_default_watermark_boost_factor:-kernel} proactiveness=${_default_compaction_proactiveness:-kernel} swappiness=${_default_swappiness:-kernel} ttm.low_latency=${_default_ttm_low_latency}"
 _l_msg2 "lunar patches: ${#_lunar_patches[@]}, user patches: $(( ${#_lunar_userreverts[@]} + ${#_lunar_userpatches[@]} ))"
 

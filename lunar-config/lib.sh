@@ -20,9 +20,10 @@ _LUNAR_OPTIONS=(
 	_base_config _localmodconfig _modprobeddb_path _menuconfig
 	_compiler _lto_mode _march _kcflags _jobs
 	_timer_freq _preempt _preempt_dynamic _tickless _nr_cpus _cpu_governor
-	_thp_enabled _thp_defrag _mglru
+	_thp_enabled _thp_defrag _thp_khugepaged_defrag _thp_khugepaged_alloc_sleep_ms _mglru
 	_patch_filemap_large_folios _patch_boost_min_wmark _patch_ttm_low_latency
 	_patch_soft_defrag_mode _patch_kswapd_hopeless _patch_lru_drain_bounded
+	_patch_khugepaged_prio
 	_default_defrag_mode _default_watermark_scale_factor
 	_default_watermark_boost_factor _default_compaction_proactiveness
 	_default_swappiness _default_ttm_low_latency _default_lru_drain_timeout_ms
@@ -63,6 +64,9 @@ lunar_validate_options() {
 	_l_in "$_menuconfig" none menuconfig nconfig xconfig || _l_die "_menuconfig must be none, menuconfig, nconfig or xconfig"
 	_l_in "$_thp_enabled" always madvise never || _l_die "_thp_enabled must be always, madvise or never"
 	_l_in "$_thp_defrag" always defer defer+madvise madvise never || _l_die "_thp_defrag must be always, defer, defer+madvise, madvise or never"
+	_l_in "${_thp_khugepaged_defrag,,}" true false yes no 1 0 || _l_die "_thp_khugepaged_defrag must be true or false"
+	[[ -z "$_thp_khugepaged_alloc_sleep_ms" ]] || _l_int_range "$_thp_khugepaged_alloc_sleep_ms" 1000 3600000 \
+		|| _l_die "_thp_khugepaged_alloc_sleep_ms must be 1000..3600000 (or empty)"
 	[[ -z "$_nr_cpus" ]] || _l_int_range "$_nr_cpus" 2 8192 || _l_die "_nr_cpus must be a number from 2 to 8192"
 	[[ -z "$_jobs" ]] || _l_int_range "$_jobs" 1 4096 || _l_die "_jobs must be a positive number"
 	[[ "$_march" =~ ^[A-Za-z0-9_.+-]+$ ]] || _l_die "_march contains invalid characters"
@@ -292,6 +296,16 @@ lunar_set_defaults() {
 	esac
 	_l_msg2 "transparent_hugepage/defrag = $_thp_defrag"
 	_l_set_line mm/huge_memory.c '^\t\(1<<TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG\)\|$' "\t$flag"
+	if ! _l_true "$_thp_khugepaged_defrag"; then
+		_l_msg2 "transparent_hugepage/khugepaged/defrag = 0"
+		_l_set_line mm/huge_memory.c '^\t\(1<<TRANSPARENT_HUGEPAGE_DEFRAG_KHUGEPAGED_FLAG\)\|$' \
+			'\t/* lunar: khugepaged/defrag=0 */'
+	fi
+	if [[ -n "$_thp_khugepaged_alloc_sleep_ms" ]]; then
+		_l_msg2 "transparent_hugepage/khugepaged/alloc_sleep_millisecs = $_thp_khugepaged_alloc_sleep_ms"
+		_l_set_line mm/khugepaged.c '^static unsigned int khugepaged_alloc_sleep_millisecs __read_mostly = [0-9]+;$' \
+			"static unsigned int khugepaged_alloc_sleep_millisecs __read_mostly = $_thp_khugepaged_alloc_sleep_ms;"
+	fi
 }
 
 # Kconfig helpers

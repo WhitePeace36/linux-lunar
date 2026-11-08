@@ -41,6 +41,7 @@ Each can be switched off in `customization.cfg`.
 | 0004 | `_patch_soft_defrag_mode` | `vm.defrag_mode=2`: kswapd/kcompactd keep whole free 2 MiB blocks like mode 1, but allocations never stall just to avoid a migratetype fallback. Opportunistic attempts that can't reclaim at all (SLUB's larger slabs, ...) don't fall back either; they retry smaller, as in mode 1, so they can't fragment the free blocks. |
 | 0005 | `_patch_kswapd_hopeless` | A kswapd that gave up ("hopeless") is revived by its own or by global direct-reclaim progress again, not only once free memory is back above the high watermark. |
 | 0006 | `_patch_lru_drain_bounded` | `vm.lru_drain_timeout_ms`: khugepaged, MADV_COLLAPSE, `fadvise(DONTNEED)`, KSM, `memory.reclaim` and `drop_caches` stop waiting after 20 ms for a CPU that can't run its LRU drain work (interrupt storm, stuck driver, ...), instead of stalling, and everyone queued behind them with it. Callers that need the drain (migration, GUP pins, ...) still wait, but the kernel log now names the stuck CPU after 1 s. Counters: `lru_drain_timeout`, `lru_drain_slow` in `/proc/vmstat`. |
+| 0007 | `_patch_khugepaged_prio` | khugepaged ran at nice 19, also while holding a program's `mmap_lock`, VMA and anon_vma locks or page cache folio locks during a collapse (and, with `khugepaged/defrag=1`, the pages its compaction moves). On a busy CPU it could then wait a long time to run again, and the program's `mmap`/`munmap`/`mprotect` calls and some page faults waited with it. It now runs at nice 0. |
 
 ## Compiled-in defaults
 
@@ -56,6 +57,7 @@ Set in `customization.cfg`, all still changeable at runtime:
 | `ttm.low_latency_alloc` | 1 | 0 |
 | `vm.lru_drain_timeout_ms` | 20 | (patch 0006 only) |
 | THP enabled / defrag | always / defer | Kconfig / madvise |
+| khugepaged defrag / alloc_sleep_millisecs | 0 / 10000 | 1 / 60000 |
 
 `watermark_boost_factor` is a percentage of the high watermark, so it is kept
 small when `watermark_scale_factor` is large (600 ≈ 175 MB on 32 GiB with 500).
@@ -64,6 +66,12 @@ small when `watermark_scale_factor` is large (600 ≈ 175 MB on 32 GiB with 500)
 fallbacks compared with 20 but caused 10-37 ms hitches in streaming reads in
 every run (proactive compaction migrates page-cache pages that are being read);
 50 kept most of the THP benefit without them.
+
+`khugepaged/defrag` 0: khugepaged merges small pages into a huge page only when
+a free 2 MiB block is there. It no longer reclaims memory (with swappiness 150
+possibly pushing a game's memory to zram) or compacts it just for a merge;
+kswapd and kcompactd produce the free blocks (`defrag_mode=2`, THP `defer`).
+After a failed allocation it tries again after 10 s instead of 60 s.
 
 Build defaults: GCC, `-march=native`, 1000 Hz, `PREEMPT` (full) with
 PREEMPT_DYNAMIC, periodic tick, `performance` CPU governor, THP `always`,
@@ -112,6 +120,7 @@ build.
 | `fragwatch.sh` | live fragmentation score, free 2 MiB blocks, kswapd state, compaction migrations and THP success per second |
 | `devwatch.sh` | find a misbehaving device: PSI irq/cpu/io/mem, busiest IRQ lines, busiest disks (busy %, wait, stuck requests), tasks blocked in D state with their kernel stack, new PCIe AER errors per device, busiest kernel threads, new kernel errors and USB disconnects (`sudo ./devwatch.sh 1`) |
 | `ipiwho.sh` | which kernel functions CPUs send each other (the `CAL` interrupts), from where and for which task, recorded for a few seconds via the `csd:csd_queue_cpu` tracepoint (`sudo ./ipiwho.sh 5`) |
+| `stallwho.bt` | bpftrace: every time a thread of one process is blocked in the kernel (D state) for longer than a threshold, with where it was blocked and **who woke it up**, with the waker's kernel stack. Shows which lock or background thread a game waited for (`sudo bpftrace tools/stallwho.bt <pid> [ms]`) |
 | `draintest.c` | reproduce the stall patch 0006 fixes: an RT task on one CPU keeps that CPU's LRU cache full while `drop_caches` / `compact_memory` wait for it (`gcc -O2 -o tools/draintest tools/draintest.c`) |
 
 `memstress -q <sec> -B <MiB> -t 0` tests proactive compaction on its own: after

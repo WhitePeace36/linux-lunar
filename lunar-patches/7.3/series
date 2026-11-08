@@ -5,3 +5,4 @@ _patch_ttm_low_latency        0003-drm-ttm-add-low_latency_alloc-parameter-to-bo
 _patch_soft_defrag_mode       0004-mm-page_alloc-add-soft-defrag_mode-vm.defrag_mode-2.patch
 _patch_kswapd_hopeless        0005-mm-vmscan-let-kswapd-and-global-direct-reclaim-reviv.patch
 _patch_lru_drain_bounded      0006-mm-folio-don-t-let-one-unresponsive-CPU-stall-best-e.patch
+_patch_khugepaged_prio        0007-mm-khugepaged-don-t-run-at-MAX_NICE.patch
