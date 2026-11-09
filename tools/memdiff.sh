@@ -20,8 +20,9 @@ mins=$(( ($(date +%s) - start) / 60 ))
 
 echo
 echo "== $label: $(uname -r), ${mins} min =="
-printf 'sysctl: defrag_mode=%s scale=%s boost=%s proactiveness=%s\n' \
+printf 'sysctl: defrag_mode=%s defrag_soft=%s scale=%s boost=%s proactiveness=%s\n' \
 	"$(sysctl -n vm.defrag_mode 2>/dev/null || echo n/a)" \
+	"$(sysctl -n vm.defrag_soft 2>/dev/null || echo n/a)" \
 	"$(sysctl -n vm.watermark_scale_factor)" \
 	"$(sysctl -n vm.watermark_boost_factor)" \
 	"$(sysctl -n vm.compaction_proactiveness)"

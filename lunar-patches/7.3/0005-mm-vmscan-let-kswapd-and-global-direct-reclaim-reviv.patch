@@ -1,4 +1,4 @@
-From bea213feba194812d81f139f2663035b3e50242e Mon Sep 17 00:00:00 2001
+From d9a832ce634e7f8f9cf241c05bfa1576b84649af Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 22:40:29 +0100
 Subject: [PATCH 5/7] mm/vmscan: let kswapd and global direct reclaim revive a

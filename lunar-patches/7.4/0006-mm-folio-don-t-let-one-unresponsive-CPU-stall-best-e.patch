@@ -1,4 +1,4 @@
-From ed397661e49b15d60f1a18793403fa3a05d92f6c Mon Sep 17 00:00:00 2001
+From a39485bcdb75696f763407110b0a56c47b62dacc Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Sat, 7 Nov 2026 16:52:27 +0100
 Subject: [PATCH 6/7] mm/folio: don't let one unresponsive CPU stall
@@ -64,10 +64,10 @@ Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
  10 files changed, 270 insertions(+), 36 deletions(-)
 
 diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
-index e84c135f6..f2034e37c 100644
+index ca912cd3c..90696e8e0 100644
 --- a/Documentation/admin-guide/sysctl/vm.rst
 +++ b/Documentation/admin-guide/sysctl/vm.rst
-@@ -40,6 +40,7 @@ Currently, these files are in /proc/sys/vm:
+@@ -41,6 +41,7 @@ Currently, these files are in /proc/sys/vm:
  - hugetlb_shm_group
  - legacy_va_layout
  - lowmem_reserve_ratio
@@ -75,7 +75,7 @@ index e84c135f6..f2034e37c 100644
  - max_map_count
  - mem_profiling         (only if CONFIG_MEM_ALLOC_PROFILING=y)
  - memory_failure_early_kill
-@@ -473,6 +474,29 @@ The minimum value is 1 (1/1 -> 100%). The value less than 1 completely
+@@ -483,6 +484,29 @@ The minimum value is 1 (1/1 -> 100%). The value less than 1 completely
  disables protection of the pages.
  
  

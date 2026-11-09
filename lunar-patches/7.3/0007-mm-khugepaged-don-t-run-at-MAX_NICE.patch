@@ -1,4 +1,4 @@
-From e5031a7a6181d6e69e2eb5f27c7b15df1f5bc675 Mon Sep 17 00:00:00 2001
+From cc9e0febf25f243a29a349a599af584b97e08126 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Sun, 8 Nov 2026 15:50:00 +0100
 Subject: [PATCH 7/7] mm/khugepaged: don't run at MAX_NICE

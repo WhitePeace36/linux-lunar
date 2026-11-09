@@ -1,0 +1,167 @@
+From dd8e7a09e8245641ce572fec6b3a887871897daf Mon Sep 17 00:00:00 2001
+From: "Claude (draft)" <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 19:01:36 +0100
+Subject: [PATCH 4/7] mm/page_alloc: add vm.defrag_soft to let defrag_mode fall
+ back early
+
+defrag_mode=1 makes kswapd and kcompactd keep the watermarks met in
+whole free pageblocks, which gives a reserve of blocks for THP and
+other pageblock-order users. It also forbids migratetype fallbacks in
+the allocator until direct reclaim and compaction have failed. For
+unmovable requests the reclaim/compaction order is promoted to
+pageblock_order, and should_reclaim_retry() lets promoted requests loop
+up to MAX_RECLAIM_RETRIES times. An order-0 slab or page table
+allocation can therefore run several rounds of direct reclaim and
+pageblock-order compaction while plenty of memory is free, which shows
+up as more allocstall/compact_stall events than with defrag_mode=0.
+
+Add vm.defrag_soft (default 0). It only has an effect with
+defrag_mode=1 and leaves the background behaviour untouched: kswapd is
+woken at pageblock order, balances on NR_FREE_PAGES_BLOCKS, and
+kcompactd targets the high watermark in whole blocks. In the
+allocator, ALLOC_NOFRAGMENT still applies to the fast path and the
+first slow path attempt (after kswapd has been woken), but if that
+fails the fallback is allowed immediately instead of entering
+reclaim/compaction for it. Direct reclaim and compaction then only run
+when memory is actually short, as with defrag_mode=0.
+
+Requests that may neither reclaim nor wake kswapd are left as they
+are. They are opportunistic higher-order attempts (SLUB's higher slab
+orders, TTM's non-beneficial orders) that cannot stall and retry with
+a smaller order; letting them fall back would only place unmovable
+pages in movable pageblocks without waking anything to repair it.
+
+This is a separate switch rather than another defrag_mode value: the
+defrag_mode=2 slot is meant for a stricter mode that prefers OOM over
+fragmentation (see the commit adding defrag_mode), and a configuration
+written for one kernel must not mean the opposite on another.
+
+Fallbacks taken with defrag_soft can be observed with the
+mm_page_alloc_extfrag tracepoint.
+
+DRAFT for linux-lunar; not submitted upstream. Test status: see
+the linux-lunar README.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Jpc2umnveVKWeq6gZjkGU7
+---
+ Documentation/admin-guide/sysctl/vm.rst | 25 +++++++++++++++
+ mm/page_alloc.c                         | 41 +++++++++++++++++++++++++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
+index 3cb0138e8..ca912cd3c 100644
+--- a/Documentation/admin-guide/sysctl/vm.rst
++++ b/Documentation/admin-guide/sysctl/vm.rst
+@@ -26,6 +26,7 @@ Currently, these files are in /proc/sys/vm:
+ - compaction_proactiveness
+ - compact_unevictable_allowed
+ - defrag_mode
++- defrag_soft
+ - dirty_background_bytes
+ - dirty_background_ratio
+ - dirty_bytes
+@@ -156,10 +157,34 @@ defrag_mode
+ 
+ When set to 1, the page allocator tries harder to avoid fragmentation
+ and maintain the ability to produce huge pages / higher-order pages.
++kswapd and kcompactd keep the watermarks met in whole free pageblocks,
++and allocations that would have to fall back to a pageblock of another
++migratetype first perform direct reclaim and compaction to avoid that.
++This can increase allocation stalls (allocstall, compact_stall),
++especially for unmovable kernel allocations; see defrag_soft.
+ 
+ It is recommended to enable this right after boot, as fragmentation,
+ once it occurred, can be long-lasting or even permanent.
+ 
++
++defrag_soft
++===========
++
++Only has an effect while defrag_mode is enabled.
++
++When set to 1, kswapd and kcompactd still keep the watermarks met in
++whole free pageblocks, as defrag_mode does, but an allocation that
++cannot be served without a fallback is allowed to fall back right away
++(after waking kswapd, if it may), instead of reclaiming or compacting
++for it. Direct reclaim and compaction then only happen when memory is
++actually short, as with defrag_mode=0. Requests that may neither
++reclaim nor wake kswapd (opportunistic higher-order attempts, such as
++SLUB's) are still not allowed to fall back and retry with a smaller
++order. This keeps a reserve of free pageblocks for huge pages without
++adding foreground stalls.
++
++The default value is 0.
++
+ dirty_background_bytes
+ ======================
+ 
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 3aea974df..2c3bebfe3 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -278,6 +278,12 @@ int user_min_free_kbytes = -1;
+ static int watermark_boost_factor __read_mostly = 15000;
+ static int watermark_scale_factor = 10;
+ int defrag_mode;
++/*
++ * vm.defrag_soft: with defrag_mode enabled, let allocations fall back to
++ * another migratetype instead of reclaiming or compacting to avoid that.
++ * See __alloc_pages_slowpath().
++ */
++static int defrag_soft;
+ 
+ /* movable_zone is the "real" zone pages in ZONE_MOVABLE are taken from */
+ int movable_zone;
+@@ -4872,6 +4878,32 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	if (page)
+ 		goto got_pg;
+ 
++	/*
++	 * defrag_mode with vm.defrag_soft: kswapd has just been woken at
++	 * pageblock order (wake_all_kswapds()) and works with kcompactd
++	 * towards whole free pageblocks at the high watermark. Don't make
++	 * this task reclaim or compact merely to avoid a migratetype
++	 * fallback; allow the fallback now and only enter reclaim/compaction
++	 * if memory is really short. The flag stays cleared for the retry
++	 * loop below.
++	 *
++	 * Requests that may neither reclaim nor wake kswapd are excluded.
++	 * They are opportunistic attempts (SLUB's higher slab orders, TTM's
++	 * non-beneficial orders, ...) that cannot stall anyway and retry
++	 * with a smaller order themselves. Letting them fall back would put
++	 * unmovable pages into movable pageblocks with nothing woken to
++	 * repair it, and those blocks are then lost to compaction for good.
++	 * As without defrag_soft, they fail below (!can_direct_reclaim).
++	 */
++	if (defrag_mode && defrag_soft &&
++	    (alloc_flags & ALLOC_NOFRAGMENT) &&
++	    (gfp_mask & __GFP_RECLAIM)) {
++		alloc_flags &= ~ALLOC_NOFRAGMENT;
++		page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
++		if (page)
++			goto got_pg;
++	}
++
+ 	reserve_flags = __gfp_pfmemalloc_flags(gfp_mask);
+ 	if (reserve_flags)
+ 		alloc_flags = alloc_flags_cma(gfp_mask) | reserve_flags |
+@@ -6961,6 +6993,15 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_ONE,
+ 	},
++	{
++		.procname	= "defrag_soft",
++		.data		= &defrag_soft,
++		.maxlen		= sizeof(defrag_soft),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
+ 	{
+ 		.procname	= "percpu_pagelist_high_fraction",
+ 		.data		= &percpu_pagelist_high_fraction,
+-- 
+2.43.0
+

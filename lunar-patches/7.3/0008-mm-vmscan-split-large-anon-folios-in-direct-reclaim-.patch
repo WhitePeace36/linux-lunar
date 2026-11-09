@@ -1,0 +1,320 @@
+From 3b26125730822f2ebaa830406fb3d2a6c0b6cd9c Mon Sep 17 00:00:00 2001
+From: "Claude (draft)" <noreply@anthropic.com>
+Date: Mon, 9 Nov 2026 16:17:06 +0100
+Subject: [PATCH 8/8] mm/vmscan: split large anon folios in direct reclaim to zram
+
+Swapping out a large anon folio to zram (or any SWP_SYNCHRONOUS_IO
+device, or zswap) compresses every page of it in the reclaiming task:
+swap_writeout() -> submit_bio_wait() runs the compressor right there.
+For a 2 MiB THP with zstd that is 3-4 ms. MGLRU isolates a single THP as
+a whole batch (scan_folios() stops at MIN_LRU_BATCH pages), so every
+direct reclaim pass that lands on THP-backed anon memory compresses a
+full 2 MiB, while an order-0 allocation needs SWAP_CLUSTER_MAX pages.
+
+With THP enabled=always, almost all anon memory is THP-backed. Measured
+on a 32 GiB desktop with 16 GiB zram (zstd), swappiness 150, while a
+program allocated several GiB within seconds: 1243 direct reclaim
+passes over 1 ms in 5 s, 972 of them reclaiming 512+ pages at 3.7 ms on
+average, in whatever task happened to allocate: pipewire and
+pipewire-pulse, the browser, the compositor of a video call client,
+systemd-journald, kworkers. The memory those 3.7 ms free goes to
+whoever allocates next.
+
+In direct reclaim, split such a folio instead, reclaim about as many
+pages as the caller still needs from its start (an aligned, physically
+contiguous range, which also serves small higher-order requests) plus
+any pages the split left unmapped, and return the other pages to the
+LRU for kswapd. A pass then compresses ~32 pages (a fraction of a ms)
+plus the split (unmap and remap of the folio under the anon_vma lock,
+tens of us). If the caller already reclaimed enough in this pass, the
+folio is kept. If the split fails, the folio is swapped out whole as
+before, so this never makes reclaim fail.
+
+Only for synchronous swap-out (swap_out_is_synchronous(): zswap, or the
+device the per-CPU swap cluster cache or the highest priority available
+device points to), and not for kswapd, proactive reclaim or
+MADV_PAGEOUT/DAMON (ignore_references), which still swap out large
+folios whole. Requests that need half the folio or more (high-order
+compaction gaps, large memcg reclaim targets) are not split either.
+
+Costs: the split huge page is gone for the rest of its pages too, they
+are swapped out (and back in) as small pages later, and khugepaged only
+collapses the range again once its swapped-out pages are back. MGLRU
+puts the returned pages into a young generation, like any anon folio
+that reclaim rejected, so they stay in memory a while longer. Under
+sustained pressure, direct reclaim splits one huge page per ~32 pages
+it needs instead of compressing one per 512.
+
+Controlled by vm.thp_direct_reclaim_split (default 0), counted in
+/proc/vmstat as thp_swpout_direct_split.
+
+DRAFT for linux-lunar; not submitted upstream. Not compiled or run yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Jpc2umnveVKWeq6gZjkGU7
+---
+ Documentation/admin-guide/mm/transhuge.rst |  5 ++
+ Documentation/admin-guide/sysctl/vm.rst    | 20 ++++++
+ include/linux/vm_event_item.h              |  1 +
+ mm/swap.h                                  |  6 ++
+ mm/swapfile.c                              | 36 ++++++++++
+ mm/vmscan.c                                | 79 ++++++++++++++++++++++
+ mm/vmstat.c                                |  1 +
+ 7 files changed, 148 insertions(+)
+
+diff --git a/Documentation/admin-guide/mm/transhuge.rst b/Documentation/admin-guide/mm/transhuge.rst
+index b187d6184..2818d6064 100644
+--- a/Documentation/admin-guide/mm/transhuge.rst
++++ b/Documentation/admin-guide/mm/transhuge.rst
+@@ -637,6 +637,11 @@ thp_swpout_fallback
+ 	Usually because failed to allocate some continuous swap space
+ 	for the huge page.
+ 
++thp_swpout_direct_split
++	is incremented every time direct reclaim splits a large anonymous
++	folio instead of swapping all of it out, see
++	vm.thp_direct_reclaim_split.
++
+ In /sys/kernel/mm/transparent_hugepage/hugepages-<size>kB/stats, There are
+ also individual counters for each huge page size, which can be utilized to
+ monitor the system's effectiveness in providing huge pages for usage. Each
+diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
+index bc0e3b3c0..e3b7b13d0 100644
+--- a/Documentation/admin-guide/sysctl/vm.rst
++++ b/Documentation/admin-guide/sysctl/vm.rst
+@@ -72,6 +72,7 @@ Currently, these files are in /proc/sys/vm:
+ - stat_refresh
+ - numa_stat
+ - swappiness
++- thp_direct_reclaim_split
+ - unprivileged_userfaultfd
+ - user_reserve_kbytes
+ - vfs_cache_pressure
+@@ -1133,6 +1134,25 @@ At 0, the kernel will not initiate swap until the amount of free and
+ file-backed pages is less than the high watermark in a zone.
+ 
+ 
++thp_direct_reclaim_split
++========================
++
++When set to 1, direct reclaim (an allocating task reclaiming memory
++itself) does not swap out a whole large anonymous folio, such as a 2 MiB
++transparent huge page, if that compresses or copies every page of it in
++the allocating task (zram and other synchronous swap devices, or zswap)
++and the task needs much less memory than that. It splits the folio,
++reclaims about as many pages as the task needs from its start, and
++leaves the rest on the LRU for kswapd. With zram and zstd this turns
++3-4 ms of compression for a 2 MiB folio into a fraction of a
++millisecond, at the cost of the split (the folio is unmapped and
++remapped) and of that huge page. kswapd, proactive reclaim
++(memory.reclaim) and MADV_PAGEOUT still swap out large folios whole.
++thp_swpout_direct_split in /proc/vmstat counts the splits.
++
++The default value is 0.
++
++
+ unprivileged_userfaultfd
+ ========================
+ 
+diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
+index 7acb26d0a..64e85695f 100644
+--- a/include/linux/vm_event_item.h
++++ b/include/linux/vm_event_item.h
+@@ -109,6 +109,7 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ 		THP_ZERO_PAGE_ALLOC_FAILED,
+ 		THP_SWPOUT,
+ 		THP_SWPOUT_FALLBACK,
++		THP_SWPOUT_DIRECT_SPLIT,
+ #endif
+ #ifdef CONFIG_BALLOON
+ 		BALLOON_INFLATE,
+diff --git a/mm/swap.h b/mm/swap.h
+index 90a551a88..e72dd2f0f 100644
+--- a/mm/swap.h
++++ b/mm/swap.h
+@@ -246,6 +246,7 @@ extern int swap_retry_table_alloc(swp_entry_t entry, gfp_t gfp);
+ int folio_alloc_swap(struct folio *folio);
+ int folio_dup_swap(struct folio *folio, struct page *page);
+ void folio_put_swap(struct folio *folio, struct page *page);
++bool swap_out_is_synchronous(unsigned int order);
+ 
+ /* For internal use */
+ extern void __swap_cluster_free_entries(struct swap_info_struct *si,
+@@ -368,6 +369,11 @@ static inline int folio_alloc_swap(struct folio *folio)
+ 	return -EINVAL;
+ }
+ 
++static inline bool swap_out_is_synchronous(unsigned int order)
++{
++	return false;
++}
++
+ static inline int folio_dup_swap(struct folio *folio, struct page *page)
+ {
+ 	return -EINVAL;
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 601979b97..443ed9ff7 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -1430,6 +1430,42 @@ static void swap_alloc_slow(struct folio *folio)
+ 	spin_unlock(&swap_avail_lock);
+ }
+ 
++/**
++ * swap_out_is_synchronous - does swapping out cost the caller CPU per page?
++ * @order: order of the folio about to be swapped out
++ *
++ * Return: true if zswap is enabled, or if the swap device that a folio of
++ * @order would most likely be written to from this CPU does synchronous
++ * I/O (zram, ...). Swapping out then compresses or copies every page of
++ * the folio in the calling task. A racy hint for reclaim.
++ */
++bool swap_out_is_synchronous(unsigned int order)
++{
++	struct swap_info_struct *si;
++	bool ret = false;
++
++	if (zswap_is_enabled())
++		return true;
++
++	if (order >= SWAP_NR_ORDERS)
++		order = 0;
++
++	/* swap_info_structs are never freed, see swap_alloc_fast() */
++	si = this_cpu_read(percpu_swap_cluster.si[order]);
++	if (si)
++		return data_race(si->flags & SWP_SYNCHRONOUS_IO);
++
++	spin_lock(&swap_avail_lock);
++	if (!plist_head_empty(&swap_avail_head)) {
++		si = plist_first_entry(&swap_avail_head, struct swap_info_struct,
++				       avail_list);
++		ret = si->flags & SWP_SYNCHRONOUS_IO;
++	}
++	spin_unlock(&swap_avail_lock);
++
++	return ret;
++}
++
+ /*
+  * Discard pending clusters in a synchronized way when under high pressure.
+  * Return: true if any cluster is discarded.
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index f420fd248..dce10a314 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1085,6 +1085,72 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
+ 	return false;
+ }
+ 
++/* vm.thp_direct_reclaim_split, see direct_reclaim_keep_large_anon() */
++static int sysctl_thp_direct_reclaim_split __read_mostly;
++
++/*
++ * Swapping out a large anon folio to zram (or any synchronous swap device,
++ * or zswap) compresses every page of it in the reclaiming task: 3-4 ms for
++ * a 2 MiB THP with zstd. In direct reclaim, whichever task allocates while
++ * memory is short pays for that (an audio thread, the compositor, a game),
++ * typically for an order-0 request that needs SWAP_CLUSTER_MAX pages.
++ *
++ * So in direct reclaim, split the folio instead, keep reclaiming about as
++ * many pages as the caller still needs from its start (an aligned,
++ * physically contiguous range, which also suits small higher-order
++ * requests) plus any pages the split left unmapped, and return the other
++ * pages to the LRU for kswapd. kswapd, proactive reclaim and MADV_PAGEOUT
++ * (ignore_references) still swap out large folios whole. If the split
++ * fails, the folio is swapped out whole as before. If the caller already
++ * reclaimed enough, keep the folio.
++ *
++ * Return: true if the caller should keep @folio, false to reclaim it (now
++ * possibly order 0, with the other pages to reclaim queued on @folio_list).
++ */
++static bool direct_reclaim_keep_large_anon(struct folio *folio,
++		struct scan_control *sc, unsigned int nr_reclaimed,
++		struct list_head *folio_list, struct list_head *ret_folios)
++{
++	unsigned long target, done, want;
++	struct folio *tail, *next;
++	LIST_HEAD(split);
++
++	if (!READ_ONCE(sysctl_thp_direct_reclaim_split) ||
++	    current_is_kswapd() || sc->proactive ||
++	    !swap_out_is_synchronous(folio_order(folio)))
++		return false;
++
++	target = max(sc->nr_to_reclaim, compact_gap(sc->order));
++	done = sc->nr_reclaimed + nr_reclaimed;
++	if (done >= target)
++		return true;
++
++	want = max(target - done, (unsigned long)SWAP_CLUSTER_MAX);
++	if (want >= folio_nr_pages(folio) / 2)
++		return false;
++
++	if (split_folio_to_list(folio, &split))
++		return false;
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	count_vm_event(THP_SWPOUT_DIRECT_SPLIT);
++#endif
++
++	/* @folio is the first page now; tails come in address order */
++	want--;
++	list_for_each_entry_safe(tail, next, &split, lru) {
++		if (!folio_mapped(tail)) {
++			list_move_tail(&tail->lru, folio_list);
++		} else if (want) {
++			want--;
++			list_move_tail(&tail->lru, folio_list);
++		} else {
++			list_move(&tail->lru, ret_folios);
++		}
++	}
++
++	return false;
++}
++
+ /*
+  * shrink_folio_list() returns the number of reclaimed pages
+  */
+@@ -1309,6 +1375,10 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
+ 				    folio_test_partially_mapped(folio)) &&
+ 				    split_folio_to_list(folio, folio_list))
+ 					goto activate_locked;
++				if (folio_test_large(folio) && !ignore_references &&
++				    direct_reclaim_keep_large_anon(folio, sc,
++						nr_reclaimed, folio_list, &ret_folios))
++					goto keep_locked;
+ 			}
+ 			if (folio_alloc_swap(folio)) {
+ 				int __maybe_unused order = folio_order(folio);
+@@ -7765,6 +7835,15 @@ static const struct ctl_table vmscan_sysctl_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_TWO_HUNDRED,
+ 	},
++	{
++		.procname	= "thp_direct_reclaim_split",
++		.data		= &sysctl_thp_direct_reclaim_split,
++		.maxlen		= sizeof(sysctl_thp_direct_reclaim_split),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
+ #ifdef CONFIG_NUMA
+ 	{
+ 		.procname	= "zone_reclaim_mode",
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index fc0b7b4a5..3aae54973 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1437,6 +1437,7 @@ const char * const vmstat_text[] = {
+ 	[I(THP_ZERO_PAGE_ALLOC_FAILED)]		= "thp_zero_page_alloc_failed",
+ 	[I(THP_SWPOUT)]				= "thp_swpout",
+ 	[I(THP_SWPOUT_FALLBACK)]		= "thp_swpout_fallback",
++	[I(THP_SWPOUT_DIRECT_SPLIT)]		= "thp_swpout_direct_split",
+ #endif
+ #ifdef CONFIG_BALLOON
+ 	[I(BALLOON_INFLATE)]			= "balloon_inflate",
+-- 
+2.43.0
+

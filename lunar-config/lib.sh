@@ -20,13 +20,19 @@ _LUNAR_OPTIONS=(
 	_base_config _localmodconfig _modprobeddb_path _menuconfig
 	_compiler _lto_mode _march _kcflags _jobs
 	_timer_freq _preempt _preempt_dynamic _tickless _nr_cpus _cpu_governor
-	_thp_enabled _thp_defrag _thp_khugepaged_defrag _thp_khugepaged_alloc_sleep_ms _mglru
+	_thp_enabled _thp_defrag _thp_shmem_enabled _thp_khugepaged_defrag
+	_thp_khugepaged_alloc_sleep_ms _thp_khugepaged_pages_to_scan
+	_thp_khugepaged_scan_sleep_ms _thp_khugepaged_max_ptes_swap _mglru _mglru_min_ttl_ms
 	_patch_filemap_large_folios _patch_boost_min_wmark _patch_ttm_low_latency
 	_patch_soft_defrag_mode _patch_kswapd_hopeless _patch_lru_drain_bounded
-	_patch_khugepaged_prio
-	_default_defrag_mode _default_watermark_scale_factor
+	_patch_khugepaged_prio _patch_direct_reclaim_split
+	_default_defrag_mode _default_defrag_soft _default_watermark_scale_factor
 	_default_watermark_boost_factor _default_compaction_proactiveness
 	_default_swappiness _default_ttm_low_latency _default_lru_drain_timeout_ms
+	_default_thp_direct_reclaim_split
+	_default_dirty_bytes _default_dirty_background_bytes _default_dirty_writeback_centisecs
+	_default_dirty_expire_centisecs
+	_default_max_map_count _default_split_lock_detect _default_split_lock_mitigate
 	_user_patches _user_patches_confirm _build_headers _noninteractive
 	_cleanup_on_abort _cleanup_after_build _keep_kernel_source
 )
@@ -67,16 +73,35 @@ lunar_validate_options() {
 	_l_in "${_thp_khugepaged_defrag,,}" true false yes no 1 0 || _l_die "_thp_khugepaged_defrag must be true or false"
 	[[ -z "$_thp_khugepaged_alloc_sleep_ms" ]] || _l_int_range "$_thp_khugepaged_alloc_sleep_ms" 1000 3600000 \
 		|| _l_die "_thp_khugepaged_alloc_sleep_ms must be 1000..3600000 (or empty)"
+	[[ -z "$_thp_shmem_enabled" ]] || _l_in "$_thp_shmem_enabled" always within_size advise never \
+		|| _l_die "_thp_shmem_enabled must be always, within_size, advise or never (or empty)"
+	[[ -z "$_thp_khugepaged_pages_to_scan" ]] || _l_int_range "$_thp_khugepaged_pages_to_scan" 1 4194304 \
+		|| _l_die "_thp_khugepaged_pages_to_scan must be 1..4194304 (or empty)"
+	[[ -z "$_thp_khugepaged_scan_sleep_ms" ]] || _l_int_range "$_thp_khugepaged_scan_sleep_ms" 100 3600000 \
+		|| _l_die "_thp_khugepaged_scan_sleep_ms must be 100..3600000 (or empty)"
+	[[ -z "$_thp_khugepaged_max_ptes_swap" ]] || _l_int_range "$_thp_khugepaged_max_ptes_swap" 0 511 \
+		|| _l_die "_thp_khugepaged_max_ptes_swap must be 0..511 (or empty)"
+	[[ -z "$_mglru_min_ttl_ms" ]] || _l_int_range "$_mglru_min_ttl_ms" 0 600000 \
+		|| _l_die "_mglru_min_ttl_ms must be 0..600000 (or empty)"
 	[[ -z "$_nr_cpus" ]] || _l_int_range "$_nr_cpus" 2 8192 || _l_die "_nr_cpus must be a number from 2 to 8192"
 	[[ -z "$_jobs" ]] || _l_int_range "$_jobs" 1 4096 || _l_die "_jobs must be a positive number"
 	[[ "$_march" =~ ^[A-Za-z0-9_.+-]+$ ]] || _l_die "_march contains invalid characters"
 	[[ "$_pkgsuffix" =~ ^[a-z0-9][a-z0-9_.+-]*$ ]] || _l_die "_pkgsuffix must be lower case letters, digits and _.+-"
 	[[ -z "$_localversion" || "$_localversion" =~ ^[A-Za-z0-9_.+-]+$ ]] || _l_die "_localversion contains invalid characters"
 
-	if [[ -n "$_default_defrag_mode" ]]; then
-		_l_int_range "$_default_defrag_mode" 0 2 || _l_die "_default_defrag_mode must be 0, 1 or 2"
-		if [[ "$_default_defrag_mode" == 2 ]] && ! _l_true "$_patch_soft_defrag_mode"; then
-			_l_die "_default_defrag_mode=2 needs _patch_soft_defrag_mode=true"
+	if [[ "$_default_defrag_mode" == 2 ]]; then   # soft mode used to be defrag_mode=2
+		_l_warn "_default_defrag_mode=2 is now _default_defrag_mode=1 plus _default_defrag_soft=true; using that"
+		_default_defrag_mode=1
+		_default_defrag_soft=true
+	fi
+	[[ -z "$_default_defrag_mode" ]] || _l_int_range "$_default_defrag_mode" 0 1 \
+		|| _l_die "_default_defrag_mode must be 0 or 1 (or empty)"
+	if [[ -n "$_default_defrag_soft" ]]; then
+		_l_in "${_default_defrag_soft,,}" true false yes no 1 0 || _l_die "_default_defrag_soft must be true or false"
+		if _l_true "$_default_defrag_soft"; then
+			_l_true "$_patch_soft_defrag_mode" || _l_die "_default_defrag_soft=true needs _patch_soft_defrag_mode=true"
+			[[ "$_default_defrag_mode" == 1 ]] \
+				|| _l_warn "_default_defrag_soft=true has no effect unless vm.defrag_mode is 1"
 		fi
 	fi
 	[[ -z "$_default_watermark_scale_factor" ]] || _l_int_range "$_default_watermark_scale_factor" 1 3000 \
@@ -104,6 +129,32 @@ lunar_validate_options() {
 		_l_true "$_patch_lru_drain_bounded" \
 			|| _l_die "_default_lru_drain_timeout_ms needs _patch_lru_drain_bounded=true (or leave it empty)"
 	fi
+	if [[ -n "$_default_thp_direct_reclaim_split" ]]; then
+		_l_in "${_default_thp_direct_reclaim_split,,}" true false yes no 1 0 \
+			|| _l_die "_default_thp_direct_reclaim_split must be true or false"
+		if _l_true "$_default_thp_direct_reclaim_split"; then
+			_l_true "$_patch_direct_reclaim_split" \
+				|| _l_die "_default_thp_direct_reclaim_split=true needs _patch_direct_reclaim_split=true"
+		fi
+	fi
+	[[ -z "$_default_dirty_bytes" ]] || _l_int_range "$_default_dirty_bytes" 8192 1099511627776 \
+		|| _l_die "_default_dirty_bytes must be 8192..1099511627776 (or empty)"
+	[[ -z "$_default_dirty_background_bytes" ]] || _l_int_range "$_default_dirty_background_bytes" 1 1099511627776 \
+		|| _l_die "_default_dirty_background_bytes must be 1..1099511627776 (or empty)"
+	if [[ -n "$_default_dirty_bytes" && -n "$_default_dirty_background_bytes" ]] \
+	   && (( _default_dirty_background_bytes >= _default_dirty_bytes )); then
+		_l_warn "_default_dirty_background_bytes >= _default_dirty_bytes: the kernel then uses half of dirty_bytes"
+	fi
+	[[ -z "$_default_dirty_writeback_centisecs" ]] || _l_int_range "$_default_dirty_writeback_centisecs" 0 100000 \
+		|| _l_die "_default_dirty_writeback_centisecs must be 0..100000 (or empty)"
+	[[ -z "$_default_dirty_expire_centisecs" ]] || _l_int_range "$_default_dirty_expire_centisecs" 0 100000 \
+		|| _l_die "_default_dirty_expire_centisecs must be 0..100000 (or empty)"
+	[[ -z "$_default_max_map_count" ]] || _l_int_range "$_default_max_map_count" 65530 2147483647 \
+		|| _l_die "_default_max_map_count must be 65530..2147483647 (or empty)"
+	[[ -z "$_default_split_lock_detect" ]] || _l_in "$_default_split_lock_detect" off warn fatal \
+		|| _l_die "_default_split_lock_detect must be off, warn or fatal (or empty)"
+	[[ -z "$_default_split_lock_mitigate" ]] || _l_int_range "$_default_split_lock_mitigate" 0 1 \
+		|| _l_die "_default_split_lock_mitigate must be 0 or 1 (or empty)"
 	return 0
 }
 
@@ -256,6 +307,10 @@ lunar_set_defaults() {
 		_l_msg2 "vm.defrag_mode = $_default_defrag_mode"
 		_l_set_line mm/page_alloc.c '^int defrag_mode( = [0-9]+)?;$' "int defrag_mode = $_default_defrag_mode;"
 	fi
+	if [[ -n "$_default_defrag_soft" ]] && _l_true "$_default_defrag_soft"; then
+		_l_msg2 "vm.defrag_soft = 1"
+		_l_set_line mm/page_alloc.c '^static int defrag_soft;$' 'static int defrag_soft = 1;'
+	fi
 	if [[ -n "$_default_watermark_scale_factor" ]]; then
 		_l_msg2 "vm.watermark_scale_factor = $_default_watermark_scale_factor"
 		_l_set_line mm/page_alloc.c '^static int watermark_scale_factor = [0-9]+;$' \
@@ -285,6 +340,56 @@ lunar_set_defaults() {
 		_l_set_line mm/folio.c '^static unsigned int sysctl_lru_drain_timeout_ms __read_mostly = [0-9]+;$' \
 			"static unsigned int sysctl_lru_drain_timeout_ms __read_mostly = $_default_lru_drain_timeout_ms;"
 	fi
+	if [[ -n "$_default_thp_direct_reclaim_split" ]] && _l_true "$_default_thp_direct_reclaim_split"; then
+		_l_msg2 "vm.thp_direct_reclaim_split = 1"
+		_l_set_line mm/vmscan.c '^static int sysctl_thp_direct_reclaim_split __read_mostly;$' \
+			'static int sysctl_thp_direct_reclaim_split __read_mostly = 1;'
+	fi
+	# Like writing vm.dirty_bytes / vm.dirty_background_bytes at runtime:
+	# the matching *_ratio becomes 0, so sysctl shows which one is in use.
+	if [[ -n "$_default_dirty_bytes" ]]; then
+		_l_msg2 "vm.dirty_bytes = $_default_dirty_bytes"
+		_l_set_line mm/page-writeback.c '^static unsigned long vm_dirty_bytes;$' \
+			"static unsigned long vm_dirty_bytes = ${_default_dirty_bytes}UL;"
+		_l_set_line mm/page-writeback.c '^static int vm_dirty_ratio = [0-9]+;$' 'static int vm_dirty_ratio;'
+	fi
+	if [[ -n "$_default_dirty_background_bytes" ]]; then
+		_l_msg2 "vm.dirty_background_bytes = $_default_dirty_background_bytes"
+		_l_set_line mm/page-writeback.c '^static unsigned long dirty_background_bytes;$' \
+			"static unsigned long dirty_background_bytes = ${_default_dirty_background_bytes}UL;"
+		_l_set_line mm/page-writeback.c '^static int dirty_background_ratio = [0-9]+;$' 'static int dirty_background_ratio;'
+	fi
+	if [[ -n "$_default_dirty_writeback_centisecs" ]]; then
+		_l_msg2 "vm.dirty_writeback_centisecs = $_default_dirty_writeback_centisecs"
+		_l_set_line mm/page-writeback.c '^unsigned int dirty_writeback_interval = [0-9]+ \* 100;.*$' \
+			"unsigned int dirty_writeback_interval = $_default_dirty_writeback_centisecs; /* centiseconds */"
+	fi
+	if [[ -n "$_default_dirty_expire_centisecs" ]]; then
+		_l_msg2 "vm.dirty_expire_centisecs = $_default_dirty_expire_centisecs"
+		_l_set_line mm/page-writeback.c '^unsigned int dirty_expire_interval = [0-9]+ \* 100;.*$' \
+			"unsigned int dirty_expire_interval = $_default_dirty_expire_centisecs; /* centiseconds */"
+	fi
+	if [[ -n "$_default_max_map_count" ]]; then
+		_l_msg2 "vm.max_map_count = $_default_max_map_count"
+		_l_set_line mm/util.c '^int sysctl_max_map_count __read_mostly = [A-Z_0-9]+;$' \
+			"int sysctl_max_map_count __read_mostly = $_default_max_map_count;"
+	fi
+	if [[ -n "$_default_split_lock_detect" ]]; then
+		_l_msg2 "split_lock_detect = $_default_split_lock_detect (kernel command line still overrides)"
+		_l_set_line arch/x86/kernel/cpu/bus_lock.c '^\tenum split_lock_detect_state state = sld_[a-z]+;$' \
+			"\tenum split_lock_detect_state state = sld_$_default_split_lock_detect;"
+	fi
+	if [[ -n "$_default_split_lock_mitigate" ]]; then
+		_l_msg2 "kernel.split_lock_mitigate = $_default_split_lock_mitigate"
+		_l_set_line arch/x86/kernel/cpu/bus_lock.c '^static unsigned int sysctl_sld_mitigate = [0-9]+;$' \
+			"static unsigned int sysctl_sld_mitigate = $_default_split_lock_mitigate;"
+	fi
+	if [[ -n "$_mglru_min_ttl_ms" ]] && (( _mglru_min_ttl_ms > 0 )); then
+		# stored in jiffies, rounded up like the sysfs file does
+		_l_msg2 "lru_gen/min_ttl_ms = $_mglru_min_ttl_ms"
+		_l_set_line mm/vmscan.c '^static unsigned long lru_gen_min_ttl __read_mostly;$' \
+			"static unsigned long lru_gen_min_ttl __read_mostly = DIV_ROUND_UP(${_mglru_min_ttl_ms}UL * HZ, MSEC_PER_SEC);"
+	fi
 
 	local flag
 	case "$_thp_defrag" in
@@ -305,6 +410,21 @@ lunar_set_defaults() {
 		_l_msg2 "transparent_hugepage/khugepaged/alloc_sleep_millisecs = $_thp_khugepaged_alloc_sleep_ms"
 		_l_set_line mm/khugepaged.c '^static unsigned int khugepaged_alloc_sleep_millisecs __read_mostly = [0-9]+;$' \
 			"static unsigned int khugepaged_alloc_sleep_millisecs __read_mostly = $_thp_khugepaged_alloc_sleep_ms;"
+	fi
+	if [[ -n "$_thp_khugepaged_scan_sleep_ms" ]]; then
+		_l_msg2 "transparent_hugepage/khugepaged/scan_sleep_millisecs = $_thp_khugepaged_scan_sleep_ms"
+		_l_set_line mm/khugepaged.c '^static unsigned int khugepaged_scan_sleep_millisecs __read_mostly = [0-9]+;$' \
+			"static unsigned int khugepaged_scan_sleep_millisecs __read_mostly = $_thp_khugepaged_scan_sleep_ms;"
+	fi
+	if [[ -n "$_thp_khugepaged_pages_to_scan" ]]; then
+		_l_msg2 "transparent_hugepage/khugepaged/pages_to_scan = $_thp_khugepaged_pages_to_scan"
+		_l_set_line mm/khugepaged.c '^\tkhugepaged_pages_to_scan = HPAGE_PMD_NR \* 8;$' \
+			"\tkhugepaged_pages_to_scan = $_thp_khugepaged_pages_to_scan;"
+	fi
+	if [[ -n "$_thp_khugepaged_max_ptes_swap" ]]; then
+		_l_msg2 "transparent_hugepage/khugepaged/max_ptes_swap = $_thp_khugepaged_max_ptes_swap"
+		_l_set_line mm/khugepaged.c '^\tkhugepaged_max_ptes_swap = HPAGE_PMD_NR / 8;$' \
+			"\tkhugepaged_max_ptes_swap = $_thp_khugepaged_max_ptes_swap;"
 	fi
 }
 
@@ -372,6 +492,11 @@ lunar_configure() {
 		madvise) _l_cfg -d TRANSPARENT_HUGEPAGE_ALWAYS -e TRANSPARENT_HUGEPAGE_MADVISE -d TRANSPARENT_HUGEPAGE_NEVER ;;
 		never)   _l_cfg -d TRANSPARENT_HUGEPAGE_ALWAYS -d TRANSPARENT_HUGEPAGE_MADVISE -e TRANSPARENT_HUGEPAGE_NEVER ;;
 	esac
+	if [[ -n "$_thp_shmem_enabled" ]]; then
+		local m
+		for m in NEVER ALWAYS WITHIN_SIZE ADVISE; do _l_cfg -d "TRANSPARENT_HUGEPAGE_SHMEM_HUGE_$m"; done
+		_l_cfg -e "TRANSPARENT_HUGEPAGE_SHMEM_HUGE_${_thp_shmem_enabled^^}"
+	fi
 	if _l_true "$_mglru"; then _l_cfg -e LRU_GEN -e LRU_GEN_ENABLED; else _l_cfg -d LRU_GEN_ENABLED; fi
 
 	make "${BUILD_FLAGS[@]}" olddefconfig >/dev/null
@@ -419,6 +544,7 @@ lunar_check_config() {
 	want+=("CONFIG_CPU_FREQ_DEFAULT_GOV_${_cpu_governor^^}=y")
 	want+=("CONFIG_TRANSPARENT_HUGEPAGE_${_thp_enabled^^}=y" CONFIG_COMPACTION=y CONFIG_PSI=y)
 	want+=(CONFIG_IRQ_TIME_ACCOUNTING=y)
+	[[ -n "$_thp_shmem_enabled" ]] && want+=("CONFIG_TRANSPARENT_HUGEPAGE_SHMEM_HUGE_${_thp_shmem_enabled^^}=y")
 	_l_true "$_mglru" && want+=(CONFIG_LRU_GEN_ENABLED=y)
 	for w in "${want[@]}"; do
 		grep -qx "$w" .config || _l_warn "Wanted $w, but Kconfig did not keep it (missing dependency?)"
