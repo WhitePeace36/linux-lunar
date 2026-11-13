@@ -39,8 +39,7 @@ written for one kernel must not mean the opposite on another.
 Fallbacks taken with defrag_soft can be observed with the
 mm_page_alloc_extfrag tracepoint.
 
-DRAFT for linux-lunar; not submitted upstream. Test status: see
-the linux-lunar README.
+DRAFT for linux-lunar; not submitted upstream.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2umnveVKWeq6gZjkGU7

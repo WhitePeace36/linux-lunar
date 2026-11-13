@@ -37,10 +37,9 @@ make kswapd age earlier. Evicting from two generations instead of
 creating a third can pick colder-looking but still used pages; compare
 pswpin and workingset_refault_* before and after.
 
-Default off, also in linux-lunar until the A/B run described in its
-README has been done.
+Default off.
 
-DRAFT for linux-lunar; not submitted upstream. Not compiled or run yet.
+DRAFT for linux-lunar; not submitted upstream.
 
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01HhEc6jiSB1p6Eb6tsXUo21

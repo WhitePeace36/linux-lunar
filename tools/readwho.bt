@@ -1,0 +1,53 @@
+#!/usr/bin/env bpftrace
+/*
+ * readwho.bt - how much of a slow read() is the reader reclaiming memory.
+ *
+ * For every pread() of one program (memstress; change the name in the first
+ * probe to trace another one) that takes 5 ms or
+ * longer, prints how much of that time was direct reclaim and direct
+ * compaction done by the reading thread itself, and in how many passes.
+ * The summary gives the totals and the reclaim passes by allocation order
+ * (order 0 = 4 KiB, 3 = 32 KiB, 9 = 2 MiB).
+ *
+ * Usage:  sudo bpftrace -o readwho.log readwho.bt     (Ctrl-C to end)
+ *
+ * Reclaim explaining most of @slow_read_us means the reads stall on their
+ * own page cache allocations. If it explains little, look at D-state waits
+ * with stallwho.bt (use a low threshold: a slow read can be many short
+ * waits).
+ */
+
+tracepoint:syscalls:sys_enter_pread64 /comm == "memstress"/ {
+	@rd[tid] = nsecs; @acc[tid] = 0; @cacc[tid] = 0; @n[tid] = 0;
+}
+
+tracepoint:vmscan:mm_vmscan_direct_reclaim_begin /@rd[tid]/ {
+	@rs[tid] = nsecs; @ro[tid] = args->order;
+}
+
+tracepoint:vmscan:mm_vmscan_direct_reclaim_end /@rs[tid]/ {
+	$us = (uint64)(nsecs - @rs[tid]) / 1000;
+	@acc[tid] = @acc[tid] + $us; @n[tid] = @n[tid] + 1;
+	@reclaim_passes_by_order[@ro[tid]] = count();
+	@reclaim_us_by_order[@ro[tid]] = sum($us);
+	delete(@rs[tid]); delete(@ro[tid]);
+}
+
+kprobe:try_to_compact_pages /@rd[tid]/ { @cs[tid] = nsecs; }
+kretprobe:try_to_compact_pages /@cs[tid]/ {
+	@cacc[tid] = @cacc[tid] + (uint64)(nsecs - @cs[tid]) / 1000; delete(@cs[tid]);
+}
+
+tracepoint:syscalls:sys_exit_pread64 /@rd[tid]/ {
+	$us = (uint64)(nsecs - @rd[tid]) / 1000;
+	if ($us >= 5000) {
+		time("%H:%M:%S ");
+		printf("read %d ms: reclaim %d ms in %d passes, compaction %d ms\n",
+		       $us / 1000, @acc[tid] / 1000, @n[tid], @cacc[tid] / 1000);
+		@slow_reads = count(); @slow_read_us = sum($us);
+		@slow_reclaim_us = sum(@acc[tid]); @slow_compact_us = sum(@cacc[tid]);
+	}
+	delete(@rd[tid]); delete(@acc[tid]); delete(@cacc[tid]); delete(@n[tid]);
+}
+
+END { clear(@rd); clear(@acc); clear(@cacc); clear(@n); clear(@rs); clear(@ro); clear(@cs); }

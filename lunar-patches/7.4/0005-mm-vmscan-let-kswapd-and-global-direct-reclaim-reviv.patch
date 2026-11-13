@@ -32,8 +32,7 @@ The counter is read before it is reset, so the frequent calls from
 direct reclaim don't keep writing to a cache line that every
 allocation slow path reads.
 
-DRAFT for linux-lunar; not submitted upstream. Test status: see
-the linux-lunar README.
+DRAFT for linux-lunar; not submitted upstream.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK

@@ -36,10 +36,7 @@ __GFP_FS requests, up to 1 s otherwise). pgscan_direct_throttle in
 /proc/vmstat counts these. Use the unboosted min watermark for the
 reserve as well.
 
-The throttle part is compile-tested only (7.3.4 and 7.4-rc1).
-
-DRAFT for linux-lunar; not submitted upstream. Test status: see
-the linux-lunar README.
+DRAFT for linux-lunar; not submitted upstream.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK

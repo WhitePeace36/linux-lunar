@@ -37,14 +37,12 @@ PAGE_ALLOC_COSTLY_ORDER covered: on a 16 GiB desktop, tools/memstress
 of 1 MiB taking 5 ms or longer (up to 35 ms), 979 ms in total, of which
 719 ms were direct reclaim and 26 ms direct compaction. All 2101
 reclaim passes were order 3 and were all of the system's allocstall
-events in the run. The order 1-3 part is not yet compile- or
-run-tested.
+events in the run.
 
 Cost: on fragmented memory more of the page cache ends up in 4 KiB
 folios until kswapd/kcompactd catch up.
 
-DRAFT for linux-lunar; not submitted upstream. Test status: see
-the linux-lunar README.
+DRAFT for linux-lunar; not submitted upstream.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK

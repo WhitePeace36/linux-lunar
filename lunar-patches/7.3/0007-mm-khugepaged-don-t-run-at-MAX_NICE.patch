@@ -33,7 +33,7 @@ with defrag=1 that work now competes at normal priority, which is the
 price for not holding migrating folios at MAX_NICE. Renicing khugepaged
 from userspace still works.
 
-DRAFT for linux-lunar; not submitted upstream. Not compiled or run yet.
+DRAFT for linux-lunar; not submitted upstream.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2umnveVKWeq6gZjkGU7

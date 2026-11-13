@@ -1,0 +1,56 @@
+#!/usr/bin/env bpftrace
+/*
+ * shrinkwho.bt - who pays for reclaim side work, and for how long.
+ *
+ * Times five kernel paths that run when memory is short and shows whether
+ * kswapd did the work or a normal task that happened to allocate:
+ *   aging         MGLRU creating a new generation (page table walk)
+ *   thp-split     splitting partially freed huge pages (deferred split)
+ *   zram-compact  zsmalloc compaction; holds a lock zram swap-ins need
+ *   ttm-shrink    the GPU page pool shrinker (amdgpu, xe, nouveau)
+ *   zone lock     returning a batch of per-CPU pages to the free lists
+ *
+ * Histograms are in microseconds. Key 1 = kswapd, key 0 = any other task
+ * (direct reclaim). Every call outside kswapd over 1 ms is printed while
+ * tracing, and every zram compaction over 10 ms with its time.
+ *
+ * Usage:  sudo bpftrace -o shrinkwho.log shrinkwho.bt     (Ctrl-C to end)
+ *
+ * A function the compiler inlined cannot be traced; bpftrace names it and
+ * that block has to be removed.
+ */
+
+kprobe:try_to_inc_max_seq { @c[tid] = nsecs; }
+kretprobe:try_to_inc_max_seq /@c[tid]/ {
+	$us = (uint64)(nsecs - @c[tid]) / 1000; delete(@c[tid]);
+	@aging_us[comm == "kswapd0"] = hist($us);
+	if ($us > 1000 && comm != "kswapd0") { printf("%s aging %d us\n", comm, $us); }
+}
+
+kprobe:deferred_split_scan { @a[tid] = nsecs; }
+kretprobe:deferred_split_scan /@a[tid]/ {
+	$us = (uint64)(nsecs - @a[tid]) / 1000; delete(@a[tid]);
+	@thp_split_us[comm == "kswapd0"] = hist($us);
+	if ($us > 1000 && comm != "kswapd0") { printf("%s thp-split %d us\n", comm, $us); }
+}
+
+kprobe:zs_shrinker_scan { @b[tid] = nsecs; }
+kretprobe:zs_shrinker_scan /@b[tid]/ {
+	$us = (uint64)(nsecs - @b[tid]) / 1000; delete(@b[tid]);
+	@zram_compact_us[comm == "kswapd0"] = hist($us);
+	if ($us > 10000) { time("%H:%M:%S "); printf("%s zram-compact %d ms\n", comm, $us / 1000); }
+}
+
+kprobe:ttm_pool_shrinker_scan { @t[tid] = nsecs; }
+kretprobe:ttm_pool_shrinker_scan /@t[tid]/ {
+	$us = (uint64)(nsecs - @t[tid]) / 1000; delete(@t[tid]);
+	@ttm_shrink_us[comm == "kswapd0"] = hist($us);
+	if ($us > 1000 && comm != "kswapd0") { printf("%s ttm-shrink %d us\n", comm, $us); }
+}
+
+kprobe:free_pcppages_bulk { @s[tid] = nsecs; }
+kretprobe:free_pcppages_bulk /@s[tid]/ {
+	@zone_lock_us = hist((uint64)(nsecs - @s[tid]) / 1000); delete(@s[tid]);
+}
+
+END { clear(@a); clear(@b); clear(@c); clear(@s); clear(@t); }

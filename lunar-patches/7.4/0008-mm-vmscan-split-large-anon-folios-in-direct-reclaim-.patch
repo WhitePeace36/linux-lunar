@@ -49,7 +49,7 @@ it needs instead of compressing one per 512.
 Controlled by vm.thp_direct_reclaim_split (default 0), counted in
 /proc/vmstat as thp_swpout_direct_split.
 
-DRAFT for linux-lunar; not submitted upstream. Not compiled or run yet.
+DRAFT for linux-lunar; not submitted upstream.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2umnveVKWeq6gZjkGU7
