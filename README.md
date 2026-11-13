@@ -73,7 +73,6 @@ Set in `customization.cfg`, all still changeable at runtime:
 | khugepaged pages_to_scan / scan_sleep_millisecs | 8192 / 2500 | 4096 / 10000 |
 | khugepaged max_ptes_swap | 0 | 64 |
 | THP shmem_enabled | always | Kconfig / never |
-| `lru_gen/min_ttl_ms` | 1000 | 0 |
 | `vm.dirty_bytes` / `vm.dirty_background_bytes` | 512 MiB / 64 MiB | 0 (20 % / 10 % ratio) |
 | `vm.dirty_writeback_centisecs` / `vm.dirty_expire_centisecs` | 100 / 500 | 500 / 3000 |
 | `vm.max_map_count` | 2147483642 | 65530 |
@@ -105,8 +104,9 @@ are merged once the program has touched them again itself.
 5-6 s instead of up to 30 s, so a crash or power loss loses less. It does not
 change stalls: large writes start background writeback at 64 MiB anyway.
 
-`lru_gen/min_ttl_ms` 1000: when memory runs out, the OOM killer ends a process
-instead of the system thrashing for minutes.
+`lru_gen/min_ttl_ms` stays at the upstream 0 (off). With 1000, kswapd's OOM
+kill fired during a `memstress -a 8` burst with 13 GiB of zram still free; the
+same run completed without it.
 
 `split_lock_detect=off`: with the upstream "warn", every split lock (some
 games do them constantly) makes the kernel slow the program down on purpose.
@@ -115,7 +115,10 @@ The `split_lock_detect=` boot parameter still overrides the default.
 
 Build defaults: GCC, `-march=native`, 1000 Hz, `PREEMPT` (full) with
 PREEMPT_DYNAMIC, periodic tick, `performance` CPU governor, THP `always`,
-MGLRU on.
+MGLRU on, cgroup `favordynmods` on (`CGROUP_FAVOR_DYNMODS`: starting a service
+or app no longer blocks fork/exec/exit system-wide while its process is moved
+into a cgroup), zswap off by default (`ZSWAP_DEFAULT_ON`; in front of zram it
+would compress everything twice).
 
 ## Other options
 
