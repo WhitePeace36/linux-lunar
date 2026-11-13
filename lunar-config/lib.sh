@@ -16,7 +16,7 @@ _l_true() { [[ "${1,,}" == "true" || "${1,,}" == "yes" || "$1" == "1" ]]; }
 
 # Every option customization.cfg knows; written to .lunar-build.cfg as resolved.
 _LUNAR_OPTIONS=(
-	_version _pkgsuffix _localversion _pgp_verify
+	_version _patch_fallback _pkgsuffix _localversion _pgp_verify
 	_base_config _localmodconfig _modprobeddb_path _menuconfig
 	_compiler _lto_mode _march _kcflags _jobs
 	_timer_freq _preempt _preempt_dynamic _tickless _nr_cpus _cpu_governor
@@ -163,7 +163,9 @@ lunar_validate_options() {
 # "7.3.1" -> "7.3", "7.4-rc1" -> "7.4", "7.3" -> "7.3"
 lunar_series_of() { local v="${1%%-rc*}"; echo "${v%.*}" | grep -Eo '^[0-9]+\.[0-9]+' || echo "$v"; }
 
-# Patch series linux-lunar ships, e.g. "7.3 7.4"
+# Patch sets linux-lunar ships: the directories in lunar-patches/ that hold a
+# series file, e.g. "7.3 7.4". A directory is named after the kernel it was
+# written for: a series ("7.3", for every 7.3.x) or one release ("7.3.3").
 lunar_supported_series() {
 	local where="$1" d out=()
 	for d in "$where"/lunar-patches/*/; do
@@ -171,6 +173,35 @@ lunar_supported_series() {
 	done
 	printf '%s\n' "${out[@]}" | sort -V
 }
+
+# Sortable number for a version: "7.3.4" -> 700030004, "7.3" -> 700030000.
+# A release candidate counts as the start of its series: "7.4-rc1" -> 700040000.
+_lunar_vkey() {
+	local v="${1%%-rc*}" a b c
+	IFS=. read -r a b c <<< "$v"
+	[[ "$a" =~ ^[0-9]+$ && "${b:-0}" =~ ^[0-9]+$ && "${c:-0}" =~ ^[0-9]+$ ]] || return 1
+	echo $(( 10#$a * 100000000 + 10#${b:-0} * 10000 + 10#${c:-0} ))
+}
+
+# Print the patch set to use for kernel version $2: the newest one that is not
+# newer than the kernel. 7.3.4 uses "7.3.4" if it exists, else "7.3.3", else
+# "7.3"; 7.5-rc1 uses "7.4" when no 7.5 set exists yet. Fails if every set is
+# newer than the kernel.
+lunar_patchset_for() {
+	local where="$1" key k s best="" bestkey=-1
+	key="$(_lunar_vkey "$2")" || return 1
+	while read -r s; do
+		[[ "$s" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || continue
+		k="$(_lunar_vkey "$s")" || continue
+		if (( k <= key && k > bestkey )); then best="$s"; bestkey="$k"; fi
+	done < <(lunar_supported_series "$where")
+	[[ -n "$best" ]] || return 1
+	echo "$best"
+}
+
+# True if patch set $2 was written for kernel version $1: it is named after
+# that exact release or after its series.
+lunar_patchset_matches() { [[ "$2" == "$1" || "$2" == "$(lunar_series_of "$1")" ]]; }
 
 # kernel.org releases.json (cached for one hour)
 _lunar_releases_json() {
@@ -207,6 +238,16 @@ lunar_resolve_series() {
 	echo "$best"
 }
 
+# Print the newest release with moniker $2 ("stable" or "mainline").
+lunar_newest_of() {
+	local where="$1" moniker="$2" v m best=""
+	while read -r v m; do
+		[[ "$m" == "$moniker" ]] && best="$v"
+	done < <(lunar_current_releases "$where" | sort -V)
+	[[ -n "$best" ]] || return 1
+	echo "$best"
+}
+
 # Set _kver, _kseries, _srcname, _src_url, _sig_url from a concrete version.
 lunar_version_urls() {
 	local v="$1" major
@@ -230,7 +271,7 @@ lunar_version_urls() {
 
 # ------------------------------------------------------------ patch lists --
 
-# Fill _lunar_patches with the enabled patches of the series (relative paths).
+# Fill _lunar_patches with the enabled patches of patch set $2 (relative paths).
 lunar_collect_patches() {
 	local where="$1" series="$2" var file
 	_lunar_patches=()
@@ -264,7 +305,7 @@ _l_patch() { # file [-R]
 	local f="$1" rev="${2:-}"
 	_l_msg2 "${rev:+Reverting}${rev:-Applying} ${f##*/}"
 	patch -Np1 ${rev:+-R} --no-backup-if-mismatch --fuzz="${_lunar_fuzz:-0}" -i "$f" \
-		|| _l_die "${f##*/} does not apply to $_srcname. Nothing was built."
+		|| _l_die "${f##*/} does not apply to $_srcname. Nothing was built.${_lunar_patch_hint:-}"
 }
 
 lunar_apply_patches() {
@@ -274,8 +315,15 @@ lunar_apply_patches() {
 		for f in "${_lunar_userreverts[@]}"; do _lunar_fuzz=2 _l_patch "$where/$f" -R; done
 	fi
 	if (( ${#_lunar_patches[@]} )); then
-		_l_msg "Applying lunar patches"
+		local _lunar_patch_hint=""
+		if [[ -n "${_patchset:-}" ]] && ! lunar_patchset_matches "$_kver" "$_patchset"; then
+			_l_msg "Applying lunar patches (written for $_patchset, trying them on $_kver)"
+			_lunar_patch_hint=" lunar-patches/$_patchset was written for $_patchset and does not fit $_kver. Build $_patchset instead (_version=\"$_patchset\"), or wait for an updated patch set."
+		else
+			_l_msg "Applying lunar patches"
+		fi
 		for f in "${_lunar_patches[@]}"; do _l_patch "$where/$f"; done
+		_lunar_patch_hint=""
 	else
 		_l_warn "No lunar patches enabled"
 	fi

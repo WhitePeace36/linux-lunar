@@ -7,3 +7,4 @@ _patch_kswapd_hopeless        0005-mm-vmscan-let-kswapd-and-global-direct-reclai
 _patch_lru_drain_bounded      0006-mm-folio-don-t-let-one-unresponsive-CPU-stall-best-e.patch
 _patch_khugepaged_prio        0007-mm-khugepaged-don-t-run-at-MAX_NICE.patch
 _patch_direct_reclaim_split   0008-mm-vmscan-split-large-anon-folios-in-direct-reclaim-.patch
+_patch_boost_min_wmark        0009-draft-mm-vmscan-keep-watermark-boost-out-of-direct-reclaim-throttle.patch

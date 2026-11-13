@@ -25,6 +25,16 @@ mkinitcpio/dracut and your bootloader's hooks like for any Arch kernel).
 | `./lunar.sh --clean` | remove build output and caches |
 | `./lunar.sh -- <makepkg options>` | pass options on to makepkg |
 
+`./lunar.sh` asks which kernel to build and offers the newest stable and the
+newest mainline release from kernel.org (`_version="stable"` or `"mainline"`
+picks one without asking). Patch sets live in `lunar-patches/<version>/`, named
+after a series (`7.3`, used for every 7.3.x) or a single release (`7.3.3`). The
+newest set that is not newer than the kernel is used. If the kernel is newer
+than every set (a new point release or series before the patches were updated),
+that older set is tried unchanged: when every patch applies exactly, the build
+continues as usual; when one does not, the build stops with an error and
+nothing is built or installed. `_patch_fallback="false"` turns this off.
+
 For PGP-verified stable tarballs, import the kernel.org keys once:
 `gpg --locate-keys torvalds@kernel.org gregkh@kernel.org`
 (or set `_pgp_verify="false"`).
