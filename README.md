@@ -73,6 +73,7 @@ Set in `customization.cfg`, all still changeable at runtime:
 | khugepaged pages_to_scan / scan_sleep_millisecs | 8192 / 2500 | 4096 / 10000 |
 | khugepaged max_ptes_swap | 0 | 64 |
 | THP shmem_enabled | always | Kconfig / never |
+| `lru_gen/min_ttl_ms` | 0 (set explicitly) | 0 |
 | `vm.dirty_bytes` / `vm.dirty_background_bytes` | 512 MiB / 64 MiB | 0 (20 % / 10 % ratio) |
 | `vm.dirty_writeback_centisecs` / `vm.dirty_expire_centisecs` | 100 / 500 | 500 / 3000 |
 | `vm.max_map_count` | 2147483642 | 65530 |
@@ -104,7 +105,7 @@ are merged once the program has touched them again itself.
 5-6 s instead of up to 30 s, so a crash or power loss loses less. It does not
 change stalls: large writes start background writeback at 64 MiB anyway.
 
-`lru_gen/min_ttl_ms` stays at the upstream 0 (off). With 1000, kswapd's OOM
+`lru_gen/min_ttl_ms` is set to 0 (off), the same as upstream. With 1000, kswapd's OOM
 kill fired during a `memstress -a 8` burst with 13 GiB of zram still free; the
 same run completed without it.
 

@@ -22,7 +22,7 @@ _LUNAR_OPTIONS=(
 	_timer_freq _preempt _preempt_dynamic _tickless _nr_cpus _cpu_governor
 	_thp_enabled _thp_defrag _thp_shmem_enabled _thp_khugepaged_defrag
 	_thp_khugepaged_alloc_sleep_ms _thp_khugepaged_pages_to_scan
-	_thp_khugepaged_scan_sleep_ms _thp_khugepaged_max_ptes_swap _mglru
+	_thp_khugepaged_scan_sleep_ms _thp_khugepaged_max_ptes_swap _mglru _mglru_min_ttl_ms
 	_patch_filemap_large_folios _patch_boost_min_wmark _patch_ttm_low_latency
 	_patch_soft_defrag_mode _patch_kswapd_hopeless _patch_lru_drain_bounded
 	_patch_khugepaged_prio _patch_direct_reclaim_split
@@ -81,6 +81,8 @@ lunar_validate_options() {
 		|| _l_die "_thp_khugepaged_scan_sleep_ms must be 100..3600000 (or empty)"
 	[[ -z "$_thp_khugepaged_max_ptes_swap" ]] || _l_int_range "$_thp_khugepaged_max_ptes_swap" 0 511 \
 		|| _l_die "_thp_khugepaged_max_ptes_swap must be 0..511 (or empty)"
+	[[ -z "$_mglru_min_ttl_ms" ]] || _l_int_range "$_mglru_min_ttl_ms" 0 600000 \
+		|| _l_die "_mglru_min_ttl_ms must be 0..600000 (or empty)"
 	[[ -z "$_nr_cpus" ]] || _l_int_range "$_nr_cpus" 2 8192 || _l_die "_nr_cpus must be a number from 2 to 8192"
 	[[ -z "$_jobs" ]] || _l_int_range "$_jobs" 1 4096 || _l_die "_jobs must be a positive number"
 	[[ "$_march" =~ ^[A-Za-z0-9_.+-]+$ ]] || _l_die "_march contains invalid characters"
@@ -429,6 +431,14 @@ lunar_set_defaults() {
 		_l_msg2 "kernel.split_lock_mitigate = $_default_split_lock_mitigate"
 		_l_set_line arch/x86/kernel/cpu/bus_lock.c '^static unsigned int sysctl_sld_mitigate = [0-9]+;$' \
 			"static unsigned int sysctl_sld_mitigate = $_default_split_lock_mitigate;"
+	fi
+	if [[ -n "$_mglru_min_ttl_ms" ]]; then
+		# Written even for 0, the upstream default: the build then stops if
+		# upstream ever changes that line. Stored in jiffies, rounded up
+		# like the sysfs file does.
+		_l_msg2 "lru_gen/min_ttl_ms = $_mglru_min_ttl_ms"
+		_l_set_line mm/vmscan.c '^static unsigned long lru_gen_min_ttl __read_mostly;$' \
+			"static unsigned long lru_gen_min_ttl __read_mostly = DIV_ROUND_UP(${_mglru_min_ttl_ms}UL * HZ, MSEC_PER_SEC);"
 	fi
 
 	local flag
