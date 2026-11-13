@@ -1,7 +1,7 @@
 From 2c2ba465aa474136bf11be13d86d23dca6927b3b Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Sun, 8 Nov 2026 15:50:00 +0100
-Subject: [PATCH 7/8] mm/khugepaged: don't run at MAX_NICE
+Subject: [PATCH 7/9] mm/khugepaged: don't run at MAX_NICE
 
 khugepaged runs at MAX_NICE so that it stays out of the way. But while
 it collapses a range it holds locks that the scanned process itself

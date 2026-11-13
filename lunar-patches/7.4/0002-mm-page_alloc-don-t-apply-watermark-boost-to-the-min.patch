@@ -1,7 +1,7 @@
 From 4e2a2780d31f96e3a1046723538fba1adddc8fc2 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 16:53:48 +0100
-Subject: [PATCH 2/8] mm/page_alloc: don't apply watermark boost to the min
+Subject: [PATCH 2/9] mm/page_alloc: don't apply watermark boost to the min
  watermark
 
 When a fallback steals a pageblock of another migratetype,

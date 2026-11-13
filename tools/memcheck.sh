@@ -29,6 +29,7 @@ done
 echo
 echo "== patch 8: direct reclaim splits huge pages instead of compressing them whole (needs patched kernel)"
 printf '  %-32s %s\n' vm.thp_direct_reclaim_split "$(sysctl -n vm.thp_direct_reclaim_split 2>/dev/null || echo n/a)"
+printf '  %-32s %s\n' vm.lru_gen_defer_direct_aging "$(sysctl -n vm.lru_gen_defer_direct_aging 2>/dev/null || echo n/a)"
 for k in thp_swpout_direct_split thp_swpout thp_swpout_fallback; do
 	printf '  %-32s %s\n' "$k (since boot)" "$(awk -v k=$k '$1 == k { print $2; f = 1 } END { if (!f) print "n/a" }' /proc/vmstat)"
 done

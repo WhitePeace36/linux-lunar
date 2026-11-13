@@ -1,7 +1,7 @@
 From 8d4312ff9503bc5efa1be3ff2245f28c94e86c3f Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Sat, 7 Nov 2026 16:52:27 +0100
-Subject: [PATCH 6/8] mm/folio: don't let one unresponsive CPU stall
+Subject: [PATCH 6/9] mm/folio: don't let one unresponsive CPU stall
  best-effort LRU drains
 
 lru_add_drain_all() queues a work item on every CPU whose per-CPU LRU

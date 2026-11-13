@@ -1,7 +1,7 @@
 From dde363670fad51c7ac253d9908fc735aec8f984f Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 16:53:47 +0100
-Subject: [PATCH 1/8] mm/filemap: allocate large page cache folios without
+Subject: [PATCH 1/9] mm/filemap: allocate large page cache folios without
  direct reclaim/compaction
 
 Page cache readahead and __filemap_get_folio() allocate folios up to

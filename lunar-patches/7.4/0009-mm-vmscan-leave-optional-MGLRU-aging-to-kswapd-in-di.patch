@@ -1,0 +1,147 @@
+From 393ca3b13f9b03faa399c6b1cd963188fe6cb442 Mon Sep 17 00:00:00 2001
+From: "Claude (draft)" <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 19:22:16 +0100
+Subject: [PATCH 9/9] mm/vmscan: leave optional MGLRU aging to kswapd in direct
+ reclaim
+
+try_to_shrink_lruvec() runs try_to_inc_max_seq() whenever
+should_run_aging() says so, in kswapd and in direct reclaim alike. With
+the mm walk enabled (lru_gen/enabled bit 0x2) that walks the page tables
+of every mm on the lruvec's list, in the task that happened to allocate.
+
+Measured with kprobes on try_to_inc_max_seq() on a 16 GiB desktop with
+16 GiB zram during tools/memstress -a 8 -t 120: about ten calls per run
+outside kswapd took 1-10 ms, in the test program but also in the
+browser, steam and an audio client thread (10.7 ms, 5.9 ms, 5.6 ms).
+Turning the walk off for everyone (lru_gen/enabled=5) is not an option:
+the same run then swapped out seven times as much and had twelve times
+as many THP fallbacks.
+
+should_run_aging() knows two cases. Aging is mandatory when fewer than
+MIN_NR_GENS evictable generations are left. It is merely preferred when
+exactly MIN_NR_GENS are left and reclaim is past the default priority;
+at the default priority it is already skipped ("gentle reclaim").
+
+Add vm.lru_gen_defer_direct_aging. When set, global direct reclaim also
+skips the preferred case and evicts from the generations that exist.
+kswapd was woken by the allocator before direct reclaim started and
+keeps aging as before. The mandatory case is unchanged, so direct
+reclaim can never run out of evictable folios because of this. Memcg
+reclaim (no kswapd to defer to) and proactive reclaim (not latency
+sensitive) are unchanged.
+
+Limits: when kswapd does not get to the aging in time, the lruvec
+reaches the mandatory case and a direct reclaimer still walks. If that
+turns out to be where the long calls come from, the next step is to
+make kswapd age earlier. Evicting from two generations instead of
+creating a third can pick colder-looking but still used pages; compare
+pswpin and workingset_refault_* before and after.
+
+Default off, also in linux-lunar until the A/B run described in its
+README has been done.
+
+DRAFT for linux-lunar; not submitted upstream. Not compiled or run yet.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HhEc6jiSB1p6Eb6tsXUo21
+---
+ Documentation/admin-guide/sysctl/vm.rst | 21 ++++++++++++++++++
+ mm/vmscan.c                             | 29 +++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
+index 63cda233b..8a831bd1b 100644
+--- a/Documentation/admin-guide/sysctl/vm.rst
++++ b/Documentation/admin-guide/sysctl/vm.rst
+@@ -42,6 +42,7 @@ Currently, these files are in /proc/sys/vm:
+ - legacy_va_layout
+ - lowmem_reserve_ratio
+ - lru_drain_timeout_ms
++- lru_gen_defer_direct_aging
+ - max_map_count
+ - mem_profiling         (only if CONFIG_MEM_ALLOC_PROFILING=y)
+ - memory_failure_early_kill
+@@ -508,6 +509,26 @@ longer than a second, the stuck CPUs are reported in the kernel log and
+ default is 20, the maximum 1000.
+ 
+ 
++lru_gen_defer_direct_aging
++==========================
++
++Only with the multi-gen LRU (CONFIG_LRU_GEN). To create a new generation
++the kernel walks the page tables of every process and reads the accessed
++bits ("aging"). When set to 1, a task in global direct reclaim (an
++allocating task reclaiming memory itself) does not start that walk while
++it can still evict from the existing generations; it evicts from those
++and leaves the aging to kswapd. The task still ages itself when nothing
++can be evicted without it. Memory cgroup reclaim, proactive reclaim
++(memory.reclaim) and kswapd are not affected.
++
++The walk scales with the amount of mapped memory and was measured at up
++to 10 ms in the allocating task on a 16 GiB desktop. Evicting from fewer,
++older generations can pick slightly worse pages; compare pswpin and
++workingset_refault_* in /proc/vmstat when changing this.
++
++The default is 0.
++
++
+ max_map_count
+ =============
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index c5cd88ca5..1536d7047 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1191,6 +1191,13 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
+ /* vm.thp_direct_reclaim_split, see direct_reclaim_keep_large_anon() */
+ static int sysctl_thp_direct_reclaim_split __read_mostly;
+ 
++/*
++ * vm.lru_gen_defer_direct_aging: with MGLRU, a task in global direct reclaim
++ * leaves aging that eviction does not depend on yet to kswapd, see
++ * should_run_aging().
++ */
++static int sysctl_lru_gen_defer_direct_aging __read_mostly;
++
+ /*
+  * Swapping out a large anon folio to zram (or any synchronous swap device,
+  * or zswap) compresses every page of it in the reclaiming task: 3-4 ms for
+@@ -5277,6 +5284,19 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
+ 	if (sc->priority == DEF_PRIORITY)
+ 		return false;
+ 
++	/*
++	 * Eviction is still possible. Aging walks the page tables of every mm
++	 * on the list, which can take milliseconds, so do not make a task in
++	 * global direct reclaim pay for it: it evicts from the generations
++	 * that exist, like at the default priority, and kswapd, which the
++	 * allocator woke before entering direct reclaim, runs the aging.
++	 * Memcg reclaim has no kswapd to defer to and proactive reclaim is
++	 * not latency sensitive, so both keep aging here.
++	 */
++	if (READ_ONCE(sysctl_lru_gen_defer_direct_aging) &&
++	    !current_is_kswapd() && root_reclaim(sc) && !sc->proactive)
++		return false;
++
+ 	/* better to run aging even though eviction is still possible */
+ 	return evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS == max_seq;
+ }
+@@ -8000,6 +8020,15 @@ static const struct ctl_table vmscan_sysctl_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_ONE,
+ 	},
++	{
++		.procname	= "lru_gen_defer_direct_aging",
++		.data		= &sysctl_lru_gen_defer_direct_aging,
++		.maxlen		= sizeof(sysctl_lru_gen_defer_direct_aging),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
+ #ifdef CONFIG_NUMA
+ 	{
+ 		.procname	= "zone_reclaim_mode",
+-- 
+2.43.0
+

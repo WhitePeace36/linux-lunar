@@ -1,7 +1,7 @@
 From 38061c219e0fd4adbb7b85ac518527785ff6864c Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Mon, 9 Nov 2026 16:17:06 +0100
-Subject: [PATCH 8/8] mm/vmscan: split large anon folios in direct reclaim to
+Subject: [PATCH 8/9] mm/vmscan: split large anon folios in direct reclaim to
  zram
 
 Swapping out a large anon folio to zram (or any SWP_SYNCHRONOUS_IO

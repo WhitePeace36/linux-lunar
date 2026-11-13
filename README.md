@@ -53,6 +53,7 @@ Each can be switched off in `customization.cfg`.
 | 0006 | `_patch_lru_drain_bounded` | `vm.lru_drain_timeout_ms`: khugepaged, MADV_COLLAPSE, `fadvise(DONTNEED)`, KSM, `memory.reclaim` and `drop_caches` stop waiting after 20 ms for a CPU that can't run its LRU drain work (interrupt storm, stuck driver, ...), instead of stalling, and everyone queued behind them with it. Callers that need the drain (migration, GUP pins, ...) still wait, but the kernel log now names the stuck CPU after 1 s. Counters: `lru_drain_timeout`, `lru_drain_slow` in `/proc/vmstat`. |
 | 0007 | `_patch_khugepaged_prio` | khugepaged ran at nice 19, also while holding a program's `mmap_lock`, VMA and anon_vma locks or page cache folio locks during a collapse (and, with `khugepaged/defrag=1`, the pages its compaction moves). On a busy CPU it could then wait a long time to run again, and the program's `mmap`/`munmap`/`mprotect` calls and some page faults waited with it. It now runs at nice 0. |
 | 0008 | `_patch_direct_reclaim_split` | `vm.thp_direct_reclaim_split`: swapping a 2 MiB huge page out to zram compresses all of it in the task that triggered reclaim, 3-4 ms with zstd, and with THP `always` almost all program memory is huge pages. When memory fills up quickly, every task that allocates then (PipeWire, the compositor, the browser, the game) can be the one paying for it. In direct reclaim the huge page is now split, only about the 32 pages the task needs are swapped out, and kswapd handles the rest later. kswapd, `memory.reclaim` and MADV_PAGEOUT still swap out huge pages whole. Counter: `thp_swpout_direct_split` in `/proc/vmstat`. |
+| 0009 | `_patch_lru_gen_defer_aging` | `vm.lru_gen_defer_direct_aging` (**off by default, not yet tested**): with MGLRU, creating a new generation walks the page tables of every process. A task that reclaims memory for itself did that walk too, 1-10 ms in the browser, steam and an audio thread under `memstress`. With the sysctl at 1 such a task evicts from the generations that exist and leaves the walk to kswapd, unless nothing can be evicted without it. Turning the walk off for everyone (`lru_gen/enabled` 5) is not the answer: the same run then swapped out seven times as much. |
 
 ## Compiled-in defaults
 
@@ -68,6 +69,7 @@ Set in `customization.cfg`, all still changeable at runtime:
 | `ttm.low_latency_alloc` | 1 | 0 |
 | `vm.lru_drain_timeout_ms` | 20 | (patch 0006 only) |
 | `vm.thp_direct_reclaim_split` | 1 | (patch 0008 only) |
+| `vm.lru_gen_defer_direct_aging` | 0 | (patch 0009 only) |
 | THP enabled / defrag | always / defer | Kconfig / madvise |
 | khugepaged defrag / alloc_sleep_millisecs | 0 / 2500 | 1 / 60000 |
 | khugepaged pages_to_scan / scan_sleep_millisecs | 8192 / 2500 | 4096 / 10000 |
