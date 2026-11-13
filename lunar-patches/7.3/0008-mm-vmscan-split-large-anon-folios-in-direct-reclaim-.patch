@@ -1,7 +1,8 @@
-From 3b26125730822f2ebaa830406fb3d2a6c0b6cd9c Mon Sep 17 00:00:00 2001
+From 38061c219e0fd4adbb7b85ac518527785ff6864c Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Mon, 9 Nov 2026 16:17:06 +0100
-Subject: [PATCH 8/8] mm/vmscan: split large anon folios in direct reclaim to zram
+Subject: [PATCH 8/8] mm/vmscan: split large anon folios in direct reclaim to
+ zram
 
 Swapping out a large anon folio to zram (or any SWP_SYNCHRONOUS_IO
 device, or zswap) compresses every page of it in the reclaiming task:
@@ -200,7 +201,7 @@ index 601979b97..443ed9ff7 100644
   * Discard pending clusters in a synchronized way when under high pressure.
   * Return: true if any cluster is discarded.
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index f420fd248..dce10a314 100644
+index 6bfa839b8..49791ac41 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -1085,6 +1085,72 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)

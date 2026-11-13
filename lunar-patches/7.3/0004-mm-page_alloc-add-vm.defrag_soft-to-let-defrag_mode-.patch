@@ -1,7 +1,7 @@
-From caa7da66e86e56c3e96312ec414f7f3e2a3fa6e5 Mon Sep 17 00:00:00 2001
+From 699cc68f3487fe9d7b242e54adc519bb3b90b424 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 19:01:36 +0100
-Subject: [PATCH 4/7] mm/page_alloc: add vm.defrag_soft to let defrag_mode fall
+Subject: [PATCH 4/8] mm/page_alloc: add vm.defrag_soft to let defrag_mode fall
  back early
 
 defrag_mode=1 makes kswapd and kcompactd keep the watermarks met in

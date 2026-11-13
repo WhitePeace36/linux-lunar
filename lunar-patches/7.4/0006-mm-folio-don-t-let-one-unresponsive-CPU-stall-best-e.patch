@@ -1,7 +1,7 @@
-From a39485bcdb75696f763407110b0a56c47b62dacc Mon Sep 17 00:00:00 2001
+From 8d4312ff9503bc5efa1be3ff2245f28c94e86c3f Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Sat, 7 Nov 2026 16:52:27 +0100
-Subject: [PATCH 6/7] mm/folio: don't let one unresponsive CPU stall
+Subject: [PATCH 6/8] mm/folio: don't let one unresponsive CPU stall
  best-effort LRU drains
 
 lru_add_drain_all() queues a work item on every CPU whose per-CPU LRU
@@ -512,10 +512,10 @@ index 35e242b48..7512acc7c 100644
  	lru_add_and_bh_lrus_drain();
  #endif
 diff --git a/mm/khugepaged.c b/mm/khugepaged.c
-index 4b71d010b..de582d2e9 100644
+index 4bbe319ef..0ecb23218 100644
 --- a/mm/khugepaged.c
 +++ b/mm/khugepaged.c
-@@ -3021,7 +3021,7 @@ static void khugepaged_do_scan(struct collapse_control *cc)
+@@ -3048,7 +3048,7 @@ static void khugepaged_do_scan(struct collapse_control *cc)
  	bool wait = true;
  	enum scan_result result = SCAN_SUCCEED;
  
@@ -524,7 +524,7 @@ index 4b71d010b..de582d2e9 100644
  
  	collapse_control_init(cc);
  	collapse_policy_khugepaged(&cc->policy);
-@@ -3250,7 +3250,7 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
+@@ -3277,7 +3277,7 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
  	collapse_control_init(cc);
  	collapse_policy_madvise(&cc->policy);
  
@@ -534,10 +534,10 @@ index 4b71d010b..de582d2e9 100644
  	for (addr = hstart; addr < hend; addr += HPAGE_PMD_SIZE) {
  		enum scan_result result = SCAN_FAIL;
 diff --git a/mm/ksm.c b/mm/ksm.c
-index dbfb8f98b..f7a734f8b 100644
+index d24b12993..ded5c7a4b 100644
 --- a/mm/ksm.c
 +++ b/mm/ksm.c
-@@ -2637,7 +2637,7 @@ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
+@@ -2648,7 +2648,7 @@ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
  		 * them here (here rather than on entry to ksm_do_scan(),
  		 * so we don't IPI too often when pages_to_scan is set low).
  		 */
@@ -547,7 +547,7 @@ index dbfb8f98b..f7a734f8b 100644
  		/*
  		 * Whereas stale stable_nodes on the stable_tree itself
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 1bcbe5016..d2ba6c59c 100644
+index 07c3288c2..a0d3c8e73 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -8205,7 +8205,7 @@ int user_proactive_reclaim(char *buf,
@@ -560,7 +560,7 @@ index 1bcbe5016..d2ba6c59c 100644
  		if (memcg) {
  			unsigned int reclaim_options;
 diff --git a/mm/vmstat.c b/mm/vmstat.c
-index a3e809c57..3e007c8bb 100644
+index c6beac6be..5578fad73 100644
 --- a/mm/vmstat.c
 +++ b/mm/vmstat.c
 @@ -1366,6 +1366,8 @@ const char * const vmstat_text[] = {

@@ -1,7 +1,7 @@
-From 2c374986d88ac852ece3e99cb7eac284009aaf7d Mon Sep 17 00:00:00 2001
+From 9e9da429bb3e80cb415f512bbc097edc0db5f68b Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Sat, 7 Nov 2026 16:52:27 +0100
-Subject: [PATCH 6/7] mm/folio: don't let one unresponsive CPU stall
+Subject: [PATCH 6/8] mm/folio: don't let one unresponsive CPU stall
  best-effort LRU drains
 
 lru_add_drain_all() queues a work item on every CPU whose per-CPU LRU
@@ -512,10 +512,10 @@ index 50a6dbe55..468ee3e6d 100644
  	lru_add_and_bh_lrus_drain();
  #endif
 diff --git a/mm/khugepaged.c b/mm/khugepaged.c
-index 792166950..d34c4e7ab 100644
+index 75639298e..f01ac62b7 100644
 --- a/mm/khugepaged.c
 +++ b/mm/khugepaged.c
-@@ -2990,7 +2990,7 @@ static void khugepaged_do_scan(struct collapse_control *cc)
+@@ -2975,7 +2975,7 @@ static void khugepaged_do_scan(struct collapse_control *cc)
  	bool wait = true;
  	enum scan_result result = SCAN_SUCCEED;
  
@@ -524,7 +524,7 @@ index 792166950..d34c4e7ab 100644
  
  	cc->progress = 0;
  	while (true) {
-@@ -3223,7 +3223,7 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
+@@ -3208,7 +3208,7 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
  	cc->progress = 0;
  
  	mmgrab(mm);
@@ -547,7 +547,7 @@ index 49d48d1e0..a8189c912 100644
  		/*
  		 * Whereas stale stable_nodes on the stable_tree itself
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 870341145..f420fd248 100644
+index ea1a70fbf..6bfa839b8 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -8054,7 +8054,7 @@ int user_proactive_reclaim(char *buf,

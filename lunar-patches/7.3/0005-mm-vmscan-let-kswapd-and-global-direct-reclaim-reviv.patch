@@ -1,7 +1,7 @@
-From d9a832ce634e7f8f9cf241c05bfa1576b84649af Mon Sep 17 00:00:00 2001
+From 34f8ccfede4f7676556a2e1798899b5b1c7ffa7a Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 22:40:29 +0100
-Subject: [PATCH 5/7] mm/vmscan: let kswapd and global direct reclaim revive a
+Subject: [PATCH 5/8] mm/vmscan: let kswapd and global direct reclaim revive a
  hopeless kswapd
 
 kswapd marks a node hopeless after MAX_RECLAIM_RETRIES runs that
@@ -42,7 +42,7 @@ Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
  1 file changed, 35 insertions(+), 2 deletions(-)
 
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index ec7431218..870341145 100644
+index bdd5f4174..ea1a70fbf 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -264,6 +264,39 @@ static bool writeback_throttling_sane(struct scan_control *sc)

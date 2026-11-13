@@ -1,7 +1,7 @@
-From f84044cf007cfe6cd30fff4705e2b03c0d756a71 Mon Sep 17 00:00:00 2001
+From 2c2ba465aa474136bf11be13d86d23dca6927b3b Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Sun, 8 Nov 2026 15:50:00 +0100
-Subject: [PATCH 7/7] mm/khugepaged: don't run at MAX_NICE
+Subject: [PATCH 7/8] mm/khugepaged: don't run at MAX_NICE
 
 khugepaged runs at MAX_NICE so that it stays out of the way. But while
 it collapses a range it holds locks that the scanned process itself
@@ -42,10 +42,10 @@ Claude-Session: https://claude.ai/code/session_01Jpc2umnveVKWeq6gZjkGU7
  1 file changed, 16 insertions(+), 1 deletion(-)
 
 diff --git a/mm/khugepaged.c b/mm/khugepaged.c
-index de582d2e9..2813e07f9 100644
+index 0ecb23218..c46e48e55 100644
 --- a/mm/khugepaged.c
 +++ b/mm/khugepaged.c
-@@ -3089,7 +3089,22 @@ static int khugepaged(void *none)
+@@ -3116,7 +3116,22 @@ static int khugepaged(void *none)
  	struct mm_slot *slot;
  
  	set_freezable();

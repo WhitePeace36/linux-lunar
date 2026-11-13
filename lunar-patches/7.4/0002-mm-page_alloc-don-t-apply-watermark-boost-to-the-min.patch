@@ -1,7 +1,7 @@
-From 72ada13909efff3ba46f9171175ad4bb1bcfb6f6 Mon Sep 17 00:00:00 2001
+From 4e2a2780d31f96e3a1046723538fba1adddc8fc2 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 16:53:48 +0100
-Subject: [PATCH 2/7] mm/page_alloc: don't apply watermark boost to the min
+Subject: [PATCH 2/8] mm/page_alloc: don't apply watermark boost to the min
  watermark
 
 When a fallback steals a pageblock of another migratetype,
@@ -22,21 +22,39 @@ fallbacks; rmqueue() already wakes kswapd when the zone is boosted and
 the boosted low/high watermarks keep it running. Ignore the boost for
 all WMARK_MIN checks in zone_watermark_fast().
 
+throttle_direct_reclaim() has the same problem one step later. It puts
+a task that enters direct reclaim to sleep while free memory in the
+zones up to ZONE_NORMAL is at or below half of the "pfmemalloc reserve",
+and allow_direct_reclaim() sums that reserve with min_wmark_pages(),
+which includes zone->watermark_boost. With the change above, ordinary
+allocations enter direct reclaim only below the real (unboosted) min
+watermark. Whenever the boost of a zone is larger than its min
+watermark, half of (min + boost) is above min, so a task entering
+direct reclaim while a boost is active would be throttled until kswapd
+has lifted free memory above that line (sleeping without timeout for
+__GFP_FS requests, up to 1 s otherwise). pgscan_direct_throttle in
+/proc/vmstat counts these. Use the unboosted min watermark for the
+reserve as well.
+
+The throttle part is compile-tested only (7.3.4 and 7.4-rc1).
+
 DRAFT for linux-lunar; not submitted upstream. Test status: see
 the linux-lunar README.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HhEc6jiSB1p6Eb6tsXUo21
 ---
  mm/page_alloc.c | 17 ++++++++++-------
- mm/vmscan.c     |  5 +++--
- 2 files changed, 13 insertions(+), 9 deletions(-)
+ mm/vmscan.c     |  7 ++++---
+ 2 files changed, 14 insertions(+), 10 deletions(-)
 
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index a8cac5e01..3aea974df 100644
+index 6624293e4..3f921abb6 100644
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
-@@ -3702,13 +3702,16 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
+@@ -3708,13 +3708,16 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
  		return true;
  
  	/*
@@ -61,9 +79,18 @@ index a8cac5e01..3aea974df 100644
  		return __zone_watermark_ok(z, order, mark, highest_zoneidx,
  					alloc_flags, free_pages);
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 9959ca158..225b67aa6 100644
+index 6a1af9b92..767207f93 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
+@@ -6854,7 +6854,7 @@ static bool allow_direct_reclaim(pg_data_t *pgdat)
+ 		if (!zone_reclaimable_pages(zone) && zone_page_state_snapshot(zone, NR_FREE_PAGES))
+ 			continue;
+ 
+-		pfmemalloc_reserve += min_wmark_pages(zone);
++		pfmemalloc_reserve += zone->_watermark[WMARK_MIN];
+ 		free_pages += zone_page_state_snapshot(zone, NR_FREE_PAGES);
+ 	}
+ 
 @@ -7335,8 +7335,9 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
  
  	/*
