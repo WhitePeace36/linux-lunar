@@ -1,7 +1,7 @@
 From 393ca3b13f9b03faa399c6b1cd963188fe6cb442 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 19:22:16 +0100
-Subject: [PATCH 9/9] mm/vmscan: leave optional MGLRU aging to kswapd in direct
+Subject: [PATCH 9/10] mm/vmscan: leave optional MGLRU aging to kswapd in direct
  reclaim
 
 try_to_shrink_lruvec() runs try_to_inc_max_seq() whenever

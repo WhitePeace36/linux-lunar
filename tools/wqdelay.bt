@@ -1,0 +1,29 @@
+#!/usr/bin/env bpftrace
+/*
+ * wqdelay.bt - how long queued kernel work waits before a worker runs it.
+ *
+ * GPU job submission (drm_sched_run_job_work, used by amdgpu, xe, nouveau)
+ * and nonblocking display commits from the compositor (commit_work) run in
+ * kworker threads at normal priority. When all CPUs are busy they wait for a
+ * CPU like any other task, and a frame's GPU work or page flip is late.
+ *
+ * Histograms are the delay from queueing to start, in microseconds, per
+ * work function. Every delay over 2 ms is printed with the time.
+ *
+ * Usage:  sudo bpftrace -o wqdelay.log wqdelay.bt     (Ctrl-C to end)
+ * Then:   grep -A15 -E 'drm_sched_run_job_work|commit_work' wqdelay.log
+ */
+
+tracepoint:workqueue:workqueue_queue_work { @q[args->work] = nsecs; }
+
+tracepoint:workqueue:workqueue_execute_start /@q[args->work]/ {
+	$us = (uint64)(nsecs - @q[args->work]) / 1000;
+	delete(@q[args->work]);
+	@queue_delay_us[ksym(args->function)] = hist($us);
+	if ($us > 2000) {
+		time("%H:%M:%S ");
+		printf("%s waited %d us before running\n", ksym(args->function), $us);
+	}
+}
+
+END { clear(@q); }

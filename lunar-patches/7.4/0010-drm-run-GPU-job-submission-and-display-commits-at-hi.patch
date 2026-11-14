@@ -1,0 +1,183 @@
+From c090f3d09bf42a2bfea50657616f593363225d2a Mon Sep 17 00:00:00 2001
+From: "Claude (draft)" <noreply@anthropic.com>
+Date: Sat, 14 Nov 2026 15:47:05 +0100
+Subject: [PATCH 10/10] drm: run GPU job submission and display commits at high
+ priority
+
+The work that gets a frame onto the screen runs in kworkers at normal
+priority:
+
+- drm_sched's run_job and free_job, on the scheduler's ordered submit
+  queue (amdgpu, nouveau and others don't pass their own),
+- nonblocking atomic commits, the compositor's page flips, on
+  system_dfl_wq, whose unbound nice 0 pool is shared with other unbound
+  work such as filesystem I/O completion,
+- amdgpu_dm's vblank control worker, which holds dc_lock, a lock the
+  commit path takes as well.
+
+With all cpus busy these workers wait for a cpu like any other task.
+Measured with a workqueue_queue_work -> workqueue_execute_start tracer
+during a game under sched_ext (a game at nice -5, the compositor at
+nice -12) with stress-ng --cpu 0 in the background, about 120 s:
+
+  work                        items     >= 1 ms   >= 4 ms   max
+  drm_sched_run_job_work      844525    748       63        8-16 ms
+  commit_work                 19747     314       47        8-16 ms
+  vblank_control_worker       13731     482       101       8-16 ms
+
+The same game without background load had no run_job delay over 1 ms
+and two commit delays of 1-2 ms. Delays of several ms for a page flip
+on a 165 Hz display (6 ms per frame) are missed vblanks.
+
+Allocate the scheduler's queue and amdgpu_dm's vblank control queue
+with WQ_HIGHPRI, and run nonblocking commits on a new unbound WQ_HIGHPRI
+queue of drm_kms_helper, drm_atomic_commit_wq. It is unbound and not
+ordered like system_dfl_wq, so consecutive commits still overlap, and
+commits fall back to system_dfl_wq if it could not be allocated.
+High priority workers run at nice -20; this work is short and runs a
+few times per frame.
+
+DRAFT for linux-lunar; not submitted upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HhEc6jiSB1p6Eb6tsXUo21
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c    |  8 +++++++-
+ drivers/gpu/drm/drm_atomic_helper.c              |  8 +++++---
+ drivers/gpu/drm/drm_crtc_helper_internal.h       |  2 ++
+ drivers/gpu/drm/drm_kms_helper_common.c          | 16 ++++++++++++++++
+ drivers/gpu/drm/scheduler/sched_main.c           |  9 +++++++--
+ 5 files changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 0ea45ab12..a657fe9fb 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -753,8 +753,14 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 	amdgpu_dm_init_color_mod();
+ 
+ 	if (adev->dm.dc->caps.max_links > 0) {
++		/*
++		 * The worker takes dc_lock, which the commit path needs as
++		 * well: at normal priority it can wait for a cpu, or be
++		 * preempted holding the lock, and hold up a page flip.
++		 */
+ 		adev->dm.vblank_control_workqueue =
+-			create_singlethread_workqueue("dm_vblank_control_workqueue");
++			alloc_ordered_workqueue("dm_vblank_control_workqueue",
++						WQ_MEM_RECLAIM | WQ_HIGHPRI);
+ 		if (!adev->dm.vblank_control_workqueue)
+ 			drm_err(adev_to_drm(adev), "failed to initialize vblank_workqueue.\n");
+ 	}
+diff --git a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_helper.c
+index ccfe3840d..039a7ebbf 100644
+--- a/drivers/gpu/drm/drm_atomic_helper.c
++++ b/drivers/gpu/drm/drm_atomic_helper.c
+@@ -2307,13 +2307,15 @@ int drm_atomic_helper_commit(struct drm_device *dev,
+ 	 * current layout.
+ 	 *
+ 	 * NOTE: Commit work has multiple phases, first hardware commit, then
+-	 * cleanup. We want them to overlap, hence need system_dfl_wq to
+-	 * make sure work items don't artificially stall on each another.
++	 * cleanup. We want them to overlap, hence need an unbound queue
++	 * (drm_atomic_commit_wq, or system_dfl_wq without it) to make sure
++	 * work items don't artificially stall on each another.
+ 	 */
+ 
+ 	drm_atomic_commit_get(state);
+ 	if (nonblock)
+-		queue_work(system_dfl_wq, &state->commit_work);
++		queue_work(drm_atomic_commit_wq ?: system_dfl_wq,
++			   &state->commit_work);
+ 	else
+ 		commit_tail(state, false);
+ 
+diff --git a/drivers/gpu/drm/drm_crtc_helper_internal.h b/drivers/gpu/drm/drm_crtc_helper_internal.h
+index adcc9a2e2..8c4d3a64e 100644
+--- a/drivers/gpu/drm/drm_crtc_helper_internal.h
++++ b/drivers/gpu/drm/drm_crtc_helper_internal.h
+@@ -37,8 +37,10 @@ struct drm_crtc;
+ struct drm_display_mode;
+ struct drm_encoder;
+ struct drm_modeset_acquire_ctx;
++struct workqueue_struct;
+ 
+ /* drm_kms_helper_common.c */
++extern struct workqueue_struct *drm_atomic_commit_wq;
+ #if IS_ENABLED(CONFIG_DRM_FBDEV_EMULATION)
+ extern bool drm_fbdev_emulation;
+ extern int drm_fbdev_overalloc;
+diff --git a/drivers/gpu/drm/drm_kms_helper_common.c b/drivers/gpu/drm/drm_kms_helper_common.c
+index b9e206b7f..aabc6c5fc 100644
+--- a/drivers/gpu/drm/drm_kms_helper_common.c
++++ b/drivers/gpu/drm/drm_kms_helper_common.c
+@@ -28,6 +28,7 @@
+ #include <linux/export.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
++#include <linux/workqueue.h>
+ 
+ #include "drm_crtc_helper_internal.h"
+ #include "drm_panic_internal.h"
+@@ -68,8 +69,21 @@ MODULE_PARM_DESC(drm_leak_fbdev_smem,
+ 
+ #endif
+ 
++/*
++ * Nonblocking atomic commits (the compositor's page flips) run here. Like
++ * system_dfl_wq it is unbound and not ordered, so the phases of consecutive
++ * commits still overlap, but its workers run at nice -20 and don't share a
++ * pool with other unbound work (filesystem I/O completion and the like). With
++ * all cpus busy, a commit on system_dfl_wq could wait milliseconds for a
++ * worker and miss its vblank. NULL if it could not be allocated: commits then
++ * use system_dfl_wq as before.
++ */
++struct workqueue_struct *drm_atomic_commit_wq;
++
+ static int __init drm_kms_helper_init(void)
+ {
++	drm_atomic_commit_wq = alloc_workqueue("drm_atomic_commit",
++					       WQ_UNBOUND | WQ_HIGHPRI, 0);
+ 	return drm_panic_helper_init();
+ }
+ module_init(drm_kms_helper_init);
+@@ -77,6 +91,8 @@ module_init(drm_kms_helper_init);
+ static void __exit drm_kms_helper_exit(void)
+ {
+ 	drm_panic_helper_exit();
++	if (drm_atomic_commit_wq)
++		destroy_workqueue(drm_atomic_commit_wq);
+ }
+ module_exit(drm_kms_helper_exit);
+ 
+diff --git a/drivers/gpu/drm/scheduler/sched_main.c b/drivers/gpu/drm/scheduler/sched_main.c
+index 99252674e..cb6d1c947 100644
+--- a/drivers/gpu/drm/scheduler/sched_main.c
++++ b/drivers/gpu/drm/scheduler/sched_main.c
+@@ -1070,6 +1070,11 @@ static void drm_sched_run_job_work(struct work_struct *w)
+ 	drm_sched_run_job_queue(sched);
+ }
+ 
++/*
++ * run_job and free_job of every frame go through this queue. With normal
++ * priority workers they wait for a cpu like any other task when all cpus are
++ * busy, and the frame reaches the GPU late; WQ_HIGHPRI workers run at nice -20.
++ */
+ static struct workqueue_struct *drm_sched_alloc_wq(const char *name)
+ {
+ #if (IS_ENABLED(CONFIG_LOCKDEP))
+@@ -1083,9 +1088,9 @@ static struct workqueue_struct *drm_sched_alloc_wq(const char *name)
+ 	 * allocated submit_wq.
+ 	 */
+ 
+-	return alloc_ordered_workqueue_lockdep_map(name, WQ_MEM_RECLAIM, &map);
++	return alloc_ordered_workqueue_lockdep_map(name, WQ_MEM_RECLAIM | WQ_HIGHPRI, &map);
+ #else
+-	return alloc_ordered_workqueue(name, WQ_MEM_RECLAIM);
++	return alloc_ordered_workqueue(name, WQ_MEM_RECLAIM | WQ_HIGHPRI);
+ #endif
+ }
+ 
+-- 
+2.43.0
+
