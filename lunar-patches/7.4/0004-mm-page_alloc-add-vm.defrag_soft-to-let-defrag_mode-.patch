@@ -1,8 +1,8 @@
-From c88510c9746f0c978f41bb45d77ba6c4589e6400 Mon Sep 17 00:00:00 2001
+From df559b571ddf9cb011b60fe7477cfc88a38eaf48 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 19:01:36 +0100
-Subject: [PATCH 4/10] mm/page_alloc: add vm.defrag_soft to let defrag_mode fall
- back early
+Subject: [PATCH 4/10] mm/page_alloc: add vm.defrag_soft to let defrag_mode
+ fall back early
 
 defrag_mode=1 makes kswapd and kcompactd keep the watermarks met in
 whole free pageblocks, which gives a reserve of blocks for THP and
@@ -25,11 +25,16 @@ fails the fallback is allowed immediately instead of entering
 reclaim/compaction for it. Direct reclaim and compaction then only run
 when memory is actually short, as with defrag_mode=0.
 
-Requests that may neither reclaim nor wake kswapd are left as they
-are. They are opportunistic higher-order attempts (SLUB's higher slab
-orders, TTM's non-beneficial orders) that cannot stall and retry with
-a smaller order; letting them fall back would only place unmovable
-pages in movable pageblocks without waking anything to repair it.
+Only requests that can enter direct reclaim are affected; the others
+cannot stall here anyway. They keep the existing !can_direct_reclaim
+rule: kswapd-waking requests may fall back, except __GFP_NORETRY ones.
+Those are opportunistic higher-order attempts (SLUB's higher slab
+orders, network page fragments, costly __GFP_NORETRY requests whose
+direct reclaim the allocator drops) that retry with a smaller order;
+letting them fall back would only place unmovable pages in movable
+pageblocks. An earlier version tested __GFP_RECLAIM instead and so let
+__GFP_NORETRY | __GFP_KSWAPD_RECLAIM requests fall back early,
+bypassing that rule.
 
 This is a separate switch rather than another defrag_mode value: the
 defrag_mode=2 slot is meant for a stricter mode that prefers OOM over
@@ -44,12 +49,12 @@ DRAFT for linux-lunar; not submitted upstream.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Jpc2umnveVKWeq6gZjkGU7
 ---
- Documentation/admin-guide/sysctl/vm.rst | 25 +++++++++++++++
+ Documentation/admin-guide/sysctl/vm.rst | 27 ++++++++++++++++
  mm/page_alloc.c                         | 41 +++++++++++++++++++++++++
- 2 files changed, 66 insertions(+)
+ 2 files changed, 68 insertions(+)
 
 diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
-index 3cb0138e8..ca912cd3c 100644
+index 3cb0138e8..bc414d02d 100644
 --- a/Documentation/admin-guide/sysctl/vm.rst
 +++ b/Documentation/admin-guide/sysctl/vm.rst
 @@ -26,6 +26,7 @@ Currently, these files are in /proc/sys/vm:
@@ -60,7 +65,7 @@ index 3cb0138e8..ca912cd3c 100644
  - dirty_background_bytes
  - dirty_background_ratio
  - dirty_bytes
-@@ -156,10 +157,34 @@ defrag_mode
+@@ -156,10 +157,36 @@ defrag_mode
  
  When set to 1, the page allocator tries harder to avoid fragmentation
  and maintain the ability to produce huge pages / higher-order pages.
@@ -84,11 +89,13 @@ index 3cb0138e8..ca912cd3c 100644
 +cannot be served without a fallback is allowed to fall back right away
 +(after waking kswapd, if it may), instead of reclaiming or compacting
 +for it. Direct reclaim and compaction then only happen when memory is
-+actually short, as with defrag_mode=0. Requests that may neither
-+reclaim nor wake kswapd (opportunistic higher-order attempts, such as
-+SLUB's) are still not allowed to fall back and retry with a smaller
-+order. This keeps a reserve of free pageblocks for huge pages without
-+adding foreground stalls.
++actually short, as with defrag_mode=0. Requests that cannot reclaim
++directly are not affected: as without defrag_soft, they fall back only
++if they may wake kswapd and are not __GFP_NORETRY attempts
++(opportunistic higher-order allocations, such as SLUB's larger slabs or
++network page fragments, retry with a smaller order instead). This keeps
++a reserve of free pageblocks for huge pages without adding foreground
++stalls.
 +
 +The default value is 0.
 +
@@ -96,7 +103,7 @@ index 3cb0138e8..ca912cd3c 100644
  ======================
  
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index 3f921abb6..34b6cd773 100644
+index 3e9933063..13f402204 100644
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
 @@ -278,6 +278,12 @@ int user_min_free_kbytes = -1;
@@ -112,7 +119,7 @@ index 3f921abb6..34b6cd773 100644
  
  /* movable_zone is the "real" zone pages in ZONE_MOVABLE are taken from */
  int movable_zone;
-@@ -4897,6 +4903,32 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+@@ -4889,6 +4895,32 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
  	if (page)
  		goto got_pg;
  
@@ -125,17 +132,17 @@ index 3f921abb6..34b6cd773 100644
 +	 * if memory is really short. The flag stays cleared for the retry
 +	 * loop below.
 +	 *
-+	 * Requests that may neither reclaim nor wake kswapd are excluded.
-+	 * They are opportunistic attempts (SLUB's higher slab orders, TTM's
-+	 * non-beneficial orders, ...) that cannot stall anyway and retry
-+	 * with a smaller order themselves. Letting them fall back would put
-+	 * unmovable pages into movable pageblocks with nothing woken to
-+	 * repair it, and those blocks are then lost to compaction for good.
-+	 * As without defrag_soft, they fail below (!can_direct_reclaim).
++	 * Only requests that would otherwise stall here are affected.
++	 * Requests that cannot direct reclaim (GFP_NOWAIT, costly
++	 * __GFP_NORETRY attempts, SLUB's higher slab orders, ...) cannot
++	 * stall anyway; they are left to the !can_direct_reclaim rule below,
++	 * which lets kswapd-waking ones fall back, except __GFP_NORETRY
++	 * ones: those retry with a smaller order, and letting them fall
++	 * back would put unmovable pages (e.g. skb page frags) into movable
++	 * pageblocks, which are then lost to compaction for good.
 +	 */
 +	if (defrag_mode && defrag_soft &&
-+	    (alloc_flags & ALLOC_NOFRAGMENT) &&
-+	    (gfp_mask & __GFP_RECLAIM)) {
++	    (alloc_flags & ALLOC_NOFRAGMENT) && can_direct_reclaim) {
 +		alloc_flags &= ~ALLOC_NOFRAGMENT;
 +		page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
 +		if (page)
@@ -145,7 +152,7 @@ index 3f921abb6..34b6cd773 100644
  	reserve_flags = __gfp_pfmemalloc_flags(gfp_mask);
  	if (reserve_flags)
  		alloc_flags = alloc_flags_cma(gfp_mask) | reserve_flags |
-@@ -7022,6 +7054,15 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
+@@ -6981,6 +7013,15 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
  		.extra1		= SYSCTL_ZERO,
  		.extra2		= SYSCTL_ONE,
  	},
@@ -162,5 +169,5 @@ index 3f921abb6..34b6cd773 100644
  		.procname	= "percpu_pagelist_high_fraction",
  		.data		= &percpu_pagelist_high_fraction,
 -- 
-2.43.0
+2.56.1
 
