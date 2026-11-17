@@ -1,4 +1,4 @@
-From c090f3d09bf42a2bfea50657616f593363225d2a Mon Sep 17 00:00:00 2001
+From fd75fe9187d44ef28da8437692d41515ff2680a0 Mon Sep 17 00:00:00 2001
 From: "Claude (draft)" <noreply@anthropic.com>
 Date: Sat, 14 Nov 2026 15:47:05 +0100
 Subject: [PATCH 10/10] drm: run GPU job submission and display commits at high
@@ -8,7 +8,8 @@ The work that gets a frame onto the screen runs in kworkers at normal
 priority:
 
 - drm_sched's run_job and free_job, on the scheduler's ordered submit
-  queue (amdgpu, nouveau and others don't pass their own),
+  queue (amdgpu, xe's GuC exec queues and others don't pass their own),
+  and on nouveau's own submit queues,
 - nonblocking atomic commits, the compositor's page flips, on
   system_dfl_wq, whose unbound nice 0 pool is shared with other unbound
   work such as filesystem I/O completion,
@@ -29,11 +30,13 @@ The same game without background load had no run_job delay over 1 ms
 and two commit delays of 1-2 ms. Delays of several ms for a page flip
 on a 165 Hz display (6 ms per frame) are missed vblanks.
 
-Allocate the scheduler's queue and amdgpu_dm's vblank control queue
-with WQ_HIGHPRI, and run nonblocking commits on a new unbound WQ_HIGHPRI
-queue of drm_kms_helper, drm_atomic_commit_wq. It is unbound and not
-ordered like system_dfl_wq, so consecutive commits still overlap, and
-commits fall back to system_dfl_wq if it could not be allocated.
+Allocate the scheduler's queue, nouveau's two submit queues (the shared
+one and the per-client one VM_BIND/NVK uses) and amdgpu_dm's vblank
+control queue with WQ_HIGHPRI, and run nonblocking commits on a new
+unbound WQ_HIGHPRI queue of drm_kms_helper, drm_atomic_commit_wq. It is
+unbound and not ordered like system_dfl_wq, so consecutive commits
+still overlap, and commits fall back to system_dfl_wq if it could not
+be allocated.
 High priority workers run at nice -20; this work is short and runs a
 few times per frame.
 
@@ -46,8 +49,10 @@ Claude-Session: https://claude.ai/code/session_01HhEc6jiSB1p6Eb6tsXUo21
  drivers/gpu/drm/drm_atomic_helper.c              |  8 +++++---
  drivers/gpu/drm/drm_crtc_helper_internal.h       |  2 ++
  drivers/gpu/drm/drm_kms_helper_common.c          | 16 ++++++++++++++++
+ drivers/gpu/drm/nouveau/nouveau_drm.c            |  4 ++--
+ drivers/gpu/drm/nouveau/nouveau_sched.c          |  5 +++--
  drivers/gpu/drm/scheduler/sched_main.c           |  9 +++++++--
- 5 files changed, 37 insertions(+), 6 deletions(-)
+ 7 files changed, 42 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 index 0ea45ab12..a657fe9fb 100644
@@ -150,6 +155,37 @@ index b9e206b7f..aabc6c5fc 100644
  }
  module_exit(drm_kms_helper_exit);
  
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c
+index 303116886..3e2028dc1 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@ -638,8 +638,8 @@ nouveau_drm_device_init(struct nouveau_drm *drm)
+ 	struct drm_device *dev = drm->dev;
+ 	int ret;
+ 
+-	drm->sched_wq = alloc_workqueue("nouveau_sched_wq_shared", WQ_PERCPU,
+-					WQ_MAX_ACTIVE);
++	drm->sched_wq = alloc_workqueue("nouveau_sched_wq_shared",
++					WQ_PERCPU | WQ_HIGHPRI, WQ_MAX_ACTIVE);
+ 	if (!drm->sched_wq)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_sched.c b/drivers/gpu/drm/nouveau/nouveau_sched.c
+index b3f02c490..f87a90ffc 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_sched.c
++++ b/drivers/gpu/drm/nouveau/nouveau_sched.c
+@@ -414,8 +414,9 @@ nouveau_sched_init(struct nouveau_sched *sched, struct nouveau_drm *drm,
+ 	int ret;
+ 
+ 	if (!wq) {
+-		wq = alloc_workqueue("nouveau_sched_wq_%d", WQ_PERCPU,
+-				     WQ_MAX_ACTIVE,
++		/* run_job/free_job of every frame, see drm_sched_alloc_wq() */
++		wq = alloc_workqueue("nouveau_sched_wq_%d",
++				     WQ_PERCPU | WQ_HIGHPRI, WQ_MAX_ACTIVE,
+ 				     current->pid);
+ 		if (!wq)
+ 			return -ENOMEM;
 diff --git a/drivers/gpu/drm/scheduler/sched_main.c b/drivers/gpu/drm/scheduler/sched_main.c
 index 99252674e..cb6d1c947 100644
 --- a/drivers/gpu/drm/scheduler/sched_main.c
@@ -179,5 +215,5 @@ index 99252674e..cb6d1c947 100644
  }
  
 -- 
-2.43.0
+2.56.1
 
