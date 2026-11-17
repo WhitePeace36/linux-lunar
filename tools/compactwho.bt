@@ -1,0 +1,134 @@
+#!/usr/bin/env bpftrace
+/*
+ * compactwho.bt - does kcompactd hold folios locked/unmapped for long, and
+ * does that stall a program's reads and faults?
+ *
+ *  - every migrate_pages() call made by kcompactd: duration, and how often
+ *    kcompactd was preempted (switched out while runnable) inside one, and
+ *    for how long. Folios of the batch stay locked and unmapped meanwhile.
+ *  - every wait of memstress threads for a folio lock or folio bit
+ *    (__folio_lock*, folio_wait_bit*) and migration_entry_wait(),
+ *    with who woke it.
+ *  - every pread() >= 4 ms: time spent in direct reclaim / direct
+ *    compaction, off-CPU blocked (by waker, with the kernel stack) and
+ *    preempted (by whom).
+ *
+ * If kcompactd is the problem, @read_blocked_woken_by_ms[kcompactd0] and the
+ * long buckets of @migration_entry_wait_us / @folio_wait_us grow while
+ * @kc_preempted_in_migrate_us shows long preemptions. Compare
+ * vm.compaction_proactiveness=0 against the value under test.
+ *
+ * Traces "memstress"; change the name in the probes to trace another program.
+ * Usage:  sudo bpftrace -o compactwho.log compactwho.bt     (Ctrl-C to end)
+ */
+
+/* ---- kcompactd migrate_pages() ---- */
+kprobe:migrate_pages /strncmp(comm, "kcompactd", 9) == 0/ { @mp[tid] = nsecs; }
+kretprobe:migrate_pages /@mp[tid]/ {
+	$us = (uint64)(nsecs - @mp[tid]) / 1000;
+	@kc_migrate_us = hist($us);
+	@kc_migrate_calls = count();
+	if ($us >= 1000) { @kc_migrate_ge1ms = count(); }
+	delete(@mp[tid]);
+}
+
+tracepoint:sched:sched_switch {
+	/* kcompactd switched out inside migrate_pages() */
+	if (@mp[args->prev_pid]) {
+		@kc_out[args->prev_pid] = nsecs;
+		@kc_out_runnable[args->prev_pid] = (args->prev_state & 0xff) == 0 ? 1 : 0;
+		@kc_out_next[args->prev_pid] = args->next_comm;
+	}
+	if (@kc_out[args->next_pid]) {
+		$t = args->next_pid;
+		$us = (uint64)(nsecs - @kc_out[$t]) / 1000;
+		if (@kc_out_runnable[$t]) {
+			@kc_preempted_in_migrate = count();
+			@kc_preempted_in_migrate_us = hist($us);
+			@kc_preempted_by[@kc_out_next[$t]] = count();
+		} else {
+			@kc_slept_in_migrate_us = hist($us);
+		}
+		delete(@kc_out[$t]); delete(@kc_out_runnable[$t]); delete(@kc_out_next[$t]);
+	}
+
+	/* memstress pread() off-CPU accounting */
+	if (@rd[args->prev_pid]) {
+		if ((args->prev_state & 0xff) != 0) { @blk_stack[args->prev_pid] = kstack(10); }
+		@off[args->prev_pid] = nsecs;
+		@off_runnable[args->prev_pid] = (args->prev_state & 0xff) == 0 ? 1 : 0;
+		@off_next[args->prev_pid] = args->next_comm;
+	}
+	if (@off[args->next_pid]) {
+		$t = args->next_pid;
+		$us = (uint64)(nsecs - @off[$t]) / 1000;
+		if (@off_runnable[$t]) {
+			@rd_preempt_us[$t] = @rd_preempt_us[$t] + $us;
+			if ($us >= 1000) { @read_preempted_by_ms[@off_next[$t]] = sum($us / 1000); }
+		} else {
+			@rd_block_us[$t] = @rd_block_us[$t] + $us;
+			if ($us >= 1000) {
+				@read_blocked_woken_by_ms[@wk[$t]] = sum($us / 1000);
+				@read_blocked_ge1ms_at[@blk_stack[$t]] = sum($us / 1000);
+			}
+		}
+		delete(@off[$t]); delete(@off_runnable[$t]); delete(@off_next[$t]); delete(@wk[$t]);
+		delete(@blk_stack[$t]);
+	}
+}
+tracepoint:sched:sched_waking /@off[args->pid]/ { @wk[args->pid] = comm; }
+
+/* ---- folio / migration-entry waits of memstress threads ---- */
+kprobe:__folio_lock, kprobe:__folio_lock_killable, kprobe:folio_wait_bit, kprobe:folio_wait_bit_killable
+/comm == "memstress" && !@fw[tid]/ { @fw[tid] = nsecs; }
+kretprobe:__folio_lock, kretprobe:__folio_lock_killable, kretprobe:folio_wait_bit, kretprobe:folio_wait_bit_killable
+/@fw[tid]/ {
+	$us = (uint64)(nsecs - @fw[tid]) / 1000;
+	@folio_wait_us = hist($us);
+	if ($us >= 1000) { @folio_wait_ge1ms_last_waker[@lastwk[tid]] = count(); }
+	delete(@fw[tid]);
+}
+kprobe:migration_entry_wait /comm == "memstress"/ { @mw[tid] = nsecs; }
+kretprobe:migration_entry_wait /@mw[tid]/ {
+	$us = (uint64)(nsecs - @mw[tid]) / 1000;
+	@migration_entry_wait_us = hist($us);
+	delete(@mw[tid]);
+}
+tracepoint:sched:sched_waking /@fw[args->pid]/ { @lastwk[args->pid] = comm; }
+
+/* ---- direct reclaim / compaction done by a reading thread ---- */
+tracepoint:vmscan:mm_vmscan_direct_reclaim_begin /@rd[tid]/ { @rs[tid] = nsecs; }
+tracepoint:vmscan:mm_vmscan_direct_reclaim_end /@rs[tid]/ {
+	@rd_reclaim_us[tid] = @rd_reclaim_us[tid] + (uint64)(nsecs - @rs[tid]) / 1000; delete(@rs[tid]);
+}
+kprobe:try_to_compact_pages /@rd[tid]/ { @cs[tid] = nsecs; }
+kretprobe:try_to_compact_pages /@cs[tid]/ {
+	@rd_compact_us[tid] = @rd_compact_us[tid] + (uint64)(nsecs - @cs[tid]) / 1000; delete(@cs[tid]);
+}
+
+/* ---- memstress pread() ---- */
+tracepoint:syscalls:sys_enter_pread64 /comm == "memstress"/ {
+	@rd[tid] = nsecs; @rd_preempt_us[tid] = 0; @rd_block_us[tid] = 0; @rd_reclaim_us[tid] = 0; @rd_compact_us[tid] = 0;
+}
+tracepoint:syscalls:sys_exit_pread64 /@rd[tid]/ {
+	$us = (uint64)(nsecs - @rd[tid]) / 1000;
+	@reads = count();
+	if ($us >= 4000) {
+		@reads_ge4ms = count();
+		@slow_read_total_ms = sum($us / 1000);
+		@slow_read_preempted_ms = sum((uint64)@rd_preempt_us[tid] / 1000);
+		@slow_read_blocked_ms = sum((uint64)@rd_block_us[tid] / 1000);
+		@slow_read_direct_reclaim_ms = sum((uint64)@rd_reclaim_us[tid] / 1000);
+		@slow_read_direct_compact_ms = sum((uint64)@rd_compact_us[tid] / 1000);
+	}
+	if ($us >= 10000) { @reads_ge10ms = count(); }
+	delete(@rd[tid]); delete(@rd_preempt_us[tid]); delete(@rd_block_us[tid]);
+	delete(@rd_reclaim_us[tid]); delete(@rd_compact_us[tid]);
+}
+
+END {
+	clear(@mp); clear(@kc_out); clear(@kc_out_runnable); clear(@kc_out_next);
+	clear(@rd); clear(@off); clear(@off_runnable); clear(@off_next); clear(@wk);
+	clear(@rd_preempt_us); clear(@rd_block_us); clear(@rd_reclaim_us); clear(@rd_compact_us);
+	clear(@blk_stack); clear(@rs); clear(@cs); clear(@fw); clear(@mw); clear(@lastwk);
+}

@@ -86,9 +86,7 @@ Set in `customization.cfg`, all still changeable at runtime:
 small when `watermark_scale_factor` is large (600 ≈ 175 MB on 32 GiB with 500).
 
 `compaction_proactiveness` 50: in `memstress -a 16` runs, 80 halved THP
-fallbacks compared with 20 but caused 10-37 ms hitches in streaming reads in
-every run (proactive compaction migrates page-cache pages that are being read);
-50 kept most of the THP benefit without them.
+fallbacks compared with 20; 50 kept most of that benefit.
 
 `khugepaged/defrag` 0: khugepaged merges small pages into a huge page only when
 a free 2 MiB block is there. It no longer reclaims memory (with swappiness 150
@@ -123,6 +121,17 @@ MGLRU on, cgroup `favordynmods` on (`CGROUP_FAVOR_DYNMODS`: starting a service
 or app no longer blocks fork/exec/exit system-wide while its process is moved
 into a cgroup), zswap off by default (`ZSWAP_DEFAULT_ON`; in front of zram it
 would compress everything twice).
+
+With the periodic tick the kernel picks the `ladder` cpuidle governor (it
+outranks menu and teo when NO_HZ is not built in); see
+`/sys/devices/system/cpu/cpuidle/current_governor`. With
+`processor.max_cstate=1 intel_idle.max_cstate=1` on the kernel command line
+that makes no difference: only POLL and C1 are left to choose from. Without
+those parameters, ladder ignores the next timer event when choosing a
+C-state, and idle cores wake every millisecond. To compare, switch at runtime
+(`echo teo | sudo tee /sys/devices/system/cpu/cpuidle/current_governor`) or
+build with `_tickless="idle"`, and compare frametimes and busy-core clocks
+(`turbostat`).
 
 ## Other options
 
@@ -170,6 +179,7 @@ build.
 | `stallwho.bt` | bpftrace: every time a thread of one process is blocked in the kernel (D state) for longer than a threshold, with where it was blocked and **who woke it up**, with the waker's kernel stack. Shows which lock or background thread a game waited for (`sudo bpftrace tools/stallwho.bt <pid> [ms]`) |
 | `shrinkwho.bt` | bpftrace: times MGLRU aging, huge page splitting, zram compaction, the TTM pool shrinker and per-CPU page batch frees, split into kswapd and normal tasks; prints every call over 1 ms that a normal task had to do (`sudo bpftrace -o shrinkwho.log tools/shrinkwho.bt`) |
 | `readwho.bt` | bpftrace: for every `pread()` of 5 ms or longer, how much of it was direct reclaim and compaction by the reading thread, and for which allocation order (`sudo bpftrace -o readwho.log tools/readwho.bt`; traces `memstress`, the program name is set in the script) |
+| `compactwho.bt` | bpftrace: does kcompactd stall a program? Times kcompactd's `migrate_pages()` calls and how often and how long it is preempted inside one (the folios stay locked and unmapped meanwhile), the program's folio lock and migration entry waits, and for every `pread()` of 4 ms or longer how much was direct reclaim, direct compaction, blocked (by waker, with the kernel stack) or preempted (by whom) (`sudo bpftrace -o compactwho.log tools/compactwho.bt`; traces `memstress`, the program name is set in the script) |
 | `wqdelay.bt` | bpftrace: how long queued kernel work waits for a worker, per work function; prints every wait over 2 ms. Run it next to a game with all CPUs loaded to see whether GPU submission (`drm_sched_run_job_work`) and page flips (`commit_work`) are delayed (`sudo bpftrace -o wqdelay.log tools/wqdelay.bt`) |
 | `draintest.c` | reproduce the stall patch 0006 fixes: an RT task on one CPU keeps that CPU's LRU cache full while `drop_caches` / `compact_memory` wait for it (`gcc -O2 -o tools/draintest tools/draintest.c`) |
 
