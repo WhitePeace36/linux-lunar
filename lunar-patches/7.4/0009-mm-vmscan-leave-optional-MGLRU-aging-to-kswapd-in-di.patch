@@ -1,5 +1,5 @@
 From 393ca3b13f9b03faa399c6b1cd963188fe6cb442 Mon Sep 17 00:00:00 2001
-From: "Claude (draft)" <noreply@anthropic.com>
+From: Timon Stipkovits <timon2201@gmail.com>
 Date: Fri, 13 Nov 2026 19:22:16 +0100
 Subject: [PATCH 9/10] mm/vmscan: leave optional MGLRU aging to kswapd in direct
  reclaim
@@ -10,7 +10,8 @@ the mm walk enabled (lru_gen/enabled bit 0x2) that walks the page tables
 of every mm on the lruvec's list, in the task that happened to allocate.
 
 Measured with kprobes on try_to_inc_max_seq() on a 16 GiB desktop with
-16 GiB zram during tools/memstress -a 8 -t 120: about ten calls per run
+16 GiB zram during the memstress test program (-a 8 -t 120, link
+below): about ten calls per run
 outside kswapd took 1-10 ms, in the test program but also in the
 browser, steam and an audio client thread (10.7 ms, 5.9 ms, 5.6 ms).
 Turning the walk off for everyone (lru_gen/enabled=5) is not an option:
@@ -39,10 +40,9 @@ pswpin and workingset_refault_* before and after.
 
 Default off.
 
-DRAFT for linux-lunar; not submitted upstream.
-
-Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01HhEc6jiSB1p6Eb6tsXUo21
+Link: https://github.com/WhitePeace36/linux-lunar/blob/main/tools/memstress.c # test program
+Assisted-by: Claude:claude-fable-5-2
+Signed-off-by: Timon Stipkovits <timon2201@gmail.com>
 ---
  Documentation/admin-guide/sysctl/vm.rst | 21 ++++++++++++++++++
  mm/vmscan.c                             | 29 +++++++++++++++++++++++++

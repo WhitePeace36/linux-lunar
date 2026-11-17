@@ -1,5 +1,5 @@
 From 85e63272fa704420c16297cd61c02bb87a946606 Mon Sep 17 00:00:00 2001
-From: "Claude (draft)" <noreply@anthropic.com>
+From: Timon Stipkovits <timon2201@gmail.com>
 Date: Thu, 5 Nov 2026 16:53:48 +0100
 Subject: [PATCH 2/10] mm/page_alloc: don't apply watermark boost to the min
  watermark
@@ -14,7 +14,7 @@ kswapd has worked the boost off. Only order-0 __GFP_HIGH allocations
 are currently exempt.
 
 With a raised vm.watermark_scale_factor the high watermark, and hence
-the maximum boost, gets large (several GB on a 32 GB machine), which
+the maximum boost, gets large (several GiB on a 32 GiB machine), which
 makes this a noticeable source of foreground stalls.
 
 The purpose of the boost is to make kswapd reclaim ahead of future
@@ -36,12 +36,9 @@ __GFP_FS requests, up to 1 s otherwise). pgscan_direct_throttle in
 /proc/vmstat counts these. Use the unboosted min watermark for the
 reserve as well.
 
-DRAFT for linux-lunar; not submitted upstream.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
-Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01HhEc6jiSB1p6Eb6tsXUo21
+Assisted-by: Claude:claude-opus-5-5
+Assisted-by: Claude:claude-fable-5-2
+Signed-off-by: Timon Stipkovits <timon2201@gmail.com>
 ---
  mm/page_alloc.c | 17 ++++++++++-------
  mm/vmscan.c     |  7 ++++---

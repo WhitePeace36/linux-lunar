@@ -1,5 +1,5 @@
 From 1969cd3f0cb0a8330c669fd82e5ec87484e74f3f Mon Sep 17 00:00:00 2001
-From: "Claude (draft)" <noreply@anthropic.com>
+From: Timon Stipkovits <timon2201@gmail.com>
 Date: Sat, 14 Nov 2026 15:48:16 +0100
 Subject: [PATCH 10/10] drm: run GPU job submission and display commits at high
  priority
@@ -19,7 +19,7 @@ priority:
   frame while VRR is possible; it takes dc_lock too and has to program
   the VRR timing before the next VUPDATE.
 
-With all cpus busy these workers wait for a cpu like any other task.
+With all CPUs busy these workers wait for a CPU like any other task.
 Measured with a workqueue_queue_work -> workqueue_execute_start tracer
 during a game under sched_ext (a game at nice -5, the compositor at
 nice -12) with stress-ng --cpu 0 in the background, about 120 s:
@@ -35,18 +35,17 @@ on a 165 Hz display (6 ms per frame) are missed vblanks.
 
 Allocate the scheduler's queue, nouveau's two submit queues (the shared
 one and the per-client one VM_BIND/NVK uses) and amdgpu_dm's vblank
-control and vmin/vmax queues with WQ_HIGHPRI, and run nonblocking commits on a new
-unbound WQ_HIGHPRI queue of drm_kms_helper, drm_atomic_commit_wq. It is
-unbound and not ordered like system_dfl_wq, so consecutive commits
-still overlap, and commits fall back to system_dfl_wq if it could not
-be allocated.
+control and vmin/vmax queues with WQ_HIGHPRI, and run nonblocking
+commits on a new unbound WQ_HIGHPRI queue of drm_kms_helper,
+drm_atomic_commit_wq. It is unbound and not ordered, like
+system_dfl_wq, so consecutive commits still overlap, and commits fall
+back to system_dfl_wq if it could not be allocated.
+
 High priority workers run at nice -20; this work is short and runs a
 few times per frame.
 
-DRAFT for linux-lunar; not submitted upstream.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01HhEc6jiSB1p6Eb6tsXUo21
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Timon Stipkovits <timon2201@gmail.com>
 ---
  .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  8 ++++-
  .../drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c |  7 ++++-

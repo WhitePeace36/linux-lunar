@@ -1,5 +1,5 @@
 From bd843f6ee5ee62adde74ab3efdb601494f54a58d Mon Sep 17 00:00:00 2001
-From: "Claude (draft)" <noreply@anthropic.com>
+From: Timon Stipkovits <timon2201@gmail.com>
 Date: Thu, 5 Nov 2026 19:01:36 +0100
 Subject: [PATCH 4/10] mm/page_alloc: add vm.defrag_soft to let defrag_mode
  fall back early
@@ -48,10 +48,8 @@ written for one kernel must not mean the opposite on another.
 Fallbacks taken with defrag_soft can be observed with the
 mm_page_alloc_extfrag tracepoint.
 
-DRAFT for linux-lunar; not submitted upstream.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01Jpc2umnveVKWeq6gZjkGU7
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Timon Stipkovits <timon2201@gmail.com>
 ---
  Documentation/admin-guide/sysctl/vm.rst | 27 ++++++++++++++++
  mm/page_alloc.c                         | 41 +++++++++++++++++++++++++

@@ -1,5 +1,5 @@
 From 2f93a1b14249aaf87c9208096fd5250f22b412e1 Mon Sep 17 00:00:00 2001
-From: "Claude (draft)" <noreply@anthropic.com>
+From: Timon Stipkovits <timon2201@gmail.com>
 Date: Mon, 9 Nov 2026 16:17:06 +0100
 Subject: [PATCH 8/10] mm/vmscan: split large anon folios in direct reclaim to
  zram
@@ -27,7 +27,7 @@ contiguous range, which also serves small higher-order requests) plus
 any pages the split left unmapped, and return the other pages to the
 LRU for kswapd. A pass then compresses ~32 pages (a fraction of a ms)
 plus the split (unmap and remap of the folio under the anon_vma lock,
-tens of us). If the caller already reclaimed enough in this pass, the
+tens of usecs). If the caller already reclaimed enough in this pass, the
 folio is kept. If the split fails, the folio is swapped out whole as
 before, so this never makes reclaim fail.
 
@@ -49,10 +49,8 @@ it needs instead of compressing one per 512.
 Controlled by vm.thp_direct_reclaim_split (default 0), counted in
 /proc/vmstat as thp_swpout_direct_split.
 
-DRAFT for linux-lunar; not submitted upstream.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01Jpc2umnveVKWeq6gZjkGU7
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Timon Stipkovits <timon2201@gmail.com>
 ---
  Documentation/admin-guide/mm/transhuge.rst |  5 ++
  Documentation/admin-guide/sysctl/vm.rst    | 20 ++++++

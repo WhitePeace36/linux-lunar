@@ -1,5 +1,5 @@
 From 9e9da429bb3e80cb415f512bbc097edc0db5f68b Mon Sep 17 00:00:00 2001
-From: "Claude (draft)" <noreply@anthropic.com>
+From: Timon Stipkovits <timon2201@gmail.com>
 Date: Sat, 7 Nov 2026 16:52:27 +0100
 Subject: [PATCH 6/10] mm/folio: don't let one unresponsive CPU stall
  best-effort LRU drains
@@ -46,10 +46,8 @@ task faulting in pages on CPU1 and CPU1's fair server set to 0:
 With the fair server left at its default both settings behave the
 same (no timeouts). No lockdep reports.
 
-DRAFT for linux-lunar; not submitted upstream.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Timon Stipkovits <timon2201@gmail.com>
 ---
  Documentation/admin-guide/sysctl/vm.rst |  24 +++
  fs/drop_caches.c                        |   2 +-

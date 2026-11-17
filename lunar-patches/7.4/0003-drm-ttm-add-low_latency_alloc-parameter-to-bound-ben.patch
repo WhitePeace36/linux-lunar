@@ -1,5 +1,5 @@
 From ef2a2b6fc7b421954dc89f4dbf9706ed44b120c0 Mon Sep 17 00:00:00 2001
-From: "Claude (draft)" <noreply@anthropic.com>
+From: Timon Stipkovits <timon2201@gmail.com>
 Date: Thu, 5 Nov 2026 16:53:48 +0100
 Subject: [PATCH 3/10] drm/ttm: add low_latency_alloc parameter to bound
  beneficial-order retries
@@ -22,10 +22,8 @@ beneficial order:
 A failed attempt falls back to smaller orders in every mode. Y and N
 are accepted as 1 and 0.
 
-DRAFT for linux-lunar; not submitted upstream.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01Jpc2uj1P9if4WYVKq5YGZK
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Timon Stipkovits <timon2201@gmail.com>
 ---
  drivers/gpu/drm/ttm/ttm_pool.c | 64 ++++++++++++++++++++++++++++++++--
  1 file changed, 62 insertions(+), 2 deletions(-)
