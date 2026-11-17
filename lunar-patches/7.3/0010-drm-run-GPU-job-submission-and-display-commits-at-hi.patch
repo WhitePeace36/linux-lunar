@@ -14,7 +14,10 @@ priority:
   system_dfl_wq, whose unbound nice 0 pool is shared with other unbound
   work such as filesystem I/O completion,
 - amdgpu_dm's vblank control worker, which holds dc_lock, a lock the
-  commit path takes as well.
+  commit path takes as well,
+- amdgpu_dm's vmin/vmax worker, queued from the vblank interrupt on every
+  frame while VRR is possible; it takes dc_lock too and has to program
+  the VRR timing before the next VUPDATE.
 
 With all cpus busy these workers wait for a cpu like any other task.
 Measured with a workqueue_queue_work -> workqueue_execute_start tracer
@@ -32,7 +35,7 @@ on a 165 Hz display (6 ms per frame) are missed vblanks.
 
 Allocate the scheduler's queue, nouveau's two submit queues (the shared
 one and the per-client one VM_BIND/NVK uses) and amdgpu_dm's vblank
-control queue with WQ_HIGHPRI, and run nonblocking commits on a new
+control and vmin/vmax queues with WQ_HIGHPRI, and run nonblocking commits on a new
 unbound WQ_HIGHPRI queue of drm_kms_helper, drm_atomic_commit_wq. It is
 unbound and not ordered like system_dfl_wq, so consecutive commits
 still overlap, and commits fall back to system_dfl_wq if it could not
@@ -46,13 +49,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01HhEc6jiSB1p6Eb6tsXUo21
 ---
  .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  8 ++++-
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c |  7 ++++-
  drivers/gpu/drm/drm_atomic_helper.c           |  8 +++--
  drivers/gpu/drm/drm_crtc_helper_internal.h    |  4 +++
  drivers/gpu/drm/drm_kms_helper_common.c       | 29 +++++++++++++++++++
  drivers/gpu/drm/nouveau/nouveau_drm.c         |  4 +--
  drivers/gpu/drm/nouveau/nouveau_sched.c       |  5 ++--
  drivers/gpu/drm/scheduler/sched_main.c        |  9 ++++--
- 7 files changed, 57 insertions(+), 10 deletions(-)
+ 8 files changed, 63 insertions(+), 11 deletions(-)
 
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 index f3551bd0b..f79423b56 100644
@@ -74,6 +78,25 @@ index f3551bd0b..f79423b56 100644
  		if (!adev->dm.vblank_control_workqueue)
  			drm_err(adev_to_drm(adev), "failed to initialize vblank_workqueue.\n");
  	}
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c
+index 74a873516..6e6d6397d 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c
+@@ -404,8 +404,13 @@ int amdgpu_dm_irq_init(struct amdgpu_device *adev)
+ 	if (!adev->dm.irq_wq)
+ 		return -ENOMEM;
+ 
++	/*
++	 * Queued from the vblank interrupt on every frame while VRR is
++	 * possible; the worker takes dc_lock, which page flips need too,
++	 * and has to program vmin/vmax before the next VUPDATE.
++	 */
+ 	adev->dm.vmin_vmax_wq = alloc_workqueue("amdgpu_dm_vmin_vmax",
+-		WQ_UNBOUND, 0);
++		WQ_UNBOUND | WQ_HIGHPRI, 0);
+ 
+ 	if (!adev->dm.vmin_vmax_wq) {
+ 		destroy_workqueue(adev->dm.irq_wq);
 diff --git a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_helper.c
 index 285aac355..a36362bc5 100644
 --- a/drivers/gpu/drm/drm_atomic_helper.c
