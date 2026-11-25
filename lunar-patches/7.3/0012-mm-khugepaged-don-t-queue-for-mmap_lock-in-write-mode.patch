@@ -27,6 +27,12 @@ new result SCAN_MMAP_LOCK_BUSY. The few tries are there because the
 folio is already allocated (possibly after compaction) and is freed
 when the collapse gives up.
 
+The kernel no longer has an mmap_write_trylock() helper, so add one to
+<linux/mmap_lock.h> next to mmap_write_lock_killable(). Like
+mmap_write_lock() it begins the mm_lock_seq write section that per-VMA
+locking depends on and reports to the mmap_lock tracepoints; a bare
+down_write_trylock() would skip both.
+
 On SCAN_MMAP_LOCK_BUSY collapse_anon() stops trying other orders in
 that PMD (the default case), khugepaged's scan address has already
 moved past it, and the range is retried on the next pass over the mm.
@@ -45,10 +51,34 @@ and swap in.
 
 Assisted-by: Claude:claude-opus-5-5
 ---
+ include/linux/mmap_lock.h          | 12 +++++++++
  include/trace/events/huge_memory.h |  3 ++-
  mm/khugepaged.c                    | 39 +++++++++++++++++++++++++++++-
- 2 files changed, 40 insertions(+), 2 deletions(-)
+ 3 files changed, 52 insertions(+), 2 deletions(-)
 
+diff --git a/include/linux/mmap_lock.h b/include/linux/mmap_lock.h
+index b8a13b8d3..a918d2c92 100644
+--- a/include/linux/mmap_lock.h
++++ b/include/linux/mmap_lock.h
+@@ -554,6 +554,18 @@ static inline void mmap_write_lock_nested(struct mm_struct *mm, int subclass)
+ 	__mmap_lock_trace_acquire_returned(mm, true, true);
+ }
+ 
++static inline bool __must_check mmap_write_trylock(struct mm_struct *mm)
++{
++	bool ret;
++
++	__mmap_lock_trace_start_locking(mm, true);
++	ret = down_write_trylock(&mm->mmap_lock) != 0;
++	if (ret)
++		mm_lock_seqcount_begin(mm);
++	__mmap_lock_trace_acquire_returned(mm, true, ret);
++	return ret;
++}
++
+ static inline int __must_check mmap_write_lock_killable(struct mm_struct *mm)
+ {
+ 	int ret;
 diff --git a/include/trace/events/huge_memory.h b/include/trace/events/huge_memory.h
 index 5a48c5406..a765b8a6d 100644
 --- a/include/trace/events/huge_memory.h
