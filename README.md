@@ -55,6 +55,9 @@ Each can be switched off in `customization.cfg`.
 | 0008 | `_patch_direct_reclaim_split` | `vm.thp_direct_reclaim_split`: swapping a 2 MiB huge page out to zram compresses all of it in the task that triggered reclaim, 3-4 ms with zstd, and with THP `always` almost all program memory is huge pages. When memory fills up quickly, every task that allocates then (PipeWire, the compositor, the browser, the game) can be the one paying for it. In direct reclaim the huge page is now split, only about the 32 pages the task needs are swapped out, and kswapd handles the rest later. kswapd, `memory.reclaim` and MADV_PAGEOUT still swap out huge pages whole. Counter: `thp_swpout_direct_split` in `/proc/vmstat`. |
 | 0009 | `_patch_lru_gen_defer_aging` | `vm.lru_gen_defer_direct_aging`: with MGLRU, creating a new generation walks the page tables of every process. A task that reclaims memory for itself did that walk too, 1-10 ms in the browser, steam and an audio thread under `memstress`. With the sysctl at 1 such a task evicts from the generations that exist and leaves the walk to kswapd, unless nothing can be evicted without it. Turning the walk off for everyone (`lru_gen/enabled` 5) is not the answer: the same run then swapped out seven times as much. In one `memstress -a 8` pair with a game running, 0 against 1: aging calls in normal tasks 9 against 1, heap touches over 10 ms 62 against 7, direct reclaim entries 6816 against 1548, swap-outs 512 k against 419 k, huge page fallbacks unchanged. |
 | 0010 | `_patch_gpu_highpri_wq` | The kernel work that gets a frame onto the screen ran in normal priority kworkers: drm_sched submitting jobs to the GPU, nonblocking atomic commits (the compositor's page flips, on the unbound pool shared with filesystem I/O completion) and amdgpu's vblank control worker, which holds a lock the commit path needs. With all CPUs busy they waited for a CPU: with a game and `stress-ng --cpu 0`, 748 job submissions, 314 page flips and 482 vblank control items waited over 1 ms, up to 16 ms, in about 120 s (`tools/wqdelay.bt`). They now run at nice -20, as do nouveau's own submit queues and amdgpu's VRR vmin/vmax worker (queued from the vblank interrupt every frame while VRR is possible, and takes the same lock); page flips get their own unbound queue, `drm_atomic_commit`. |
+| 0011 | `_patch_boost_min_wmark_checks` | Finishes 0002. Three more checks that ask "would the allocation already succeed?" still counted the watermark boost: the allocator's decision to keep retrying reclaim, and the two points where high-order reclaim stops because the allocation can go through. While a boost was active, high-order direct reclaim therefore kept going after its allocation would already have succeeded. They now use the same unboosted min watermark as the allocator. Needs 0002. |
+| 0012 | `_patch_khugepaged_trylock` | khugepaged takes a program's `mmap_lock` in write mode to merge 4 KiB pages into a huge page. It used to queue for the lock, and while it waited, the program's `mmap()`, `mprotect()`, `munmap()` and page faults that cannot use the per-VMA lock queued behind it (Wine/Proton call these all the time). It now takes the lock only when it is free (three tries, one timer tick apart: 1 ms at 1000 Hz) and otherwise retries that range on its next pass. `MADV_COLLAPSE` still waits. Shows up as `status=mmap_lock_busy` in the `huge_memory:mm_collapse_huge_page` tracepoint. |
+| 0013 | `_patch_thp_shrinker_defer` | `vm.thp_shrinker_defer_direct`: two shrinkers free memory only by splitting huge pages (the deferred split queue, and memfd/shmem huge pages that reach past the end of their file), and they ran in whichever task reclaimed. With the sysctl at 1, a task in global direct reclaim leaves them to kswapd, except in the last two reclaim passes before an allocation fails. The shrinker core scales their work by reclaim priority, so they mostly run once reclaim has become hard; not measured yet, default off. `tools/shrinkwho.bt` times both (`thp-split`, `shmem-split`). |
 
 ## Compiled-in defaults
 
@@ -67,10 +70,11 @@ Set in `customization.cfg`, all still changeable at runtime:
 | `vm.watermark_boost_factor` | 600 | 15000 |
 | `vm.compaction_proactiveness` | 50 | 20 |
 | `vm.swappiness` | 150 | 60 |
-| `ttm.low_latency_alloc` | 1 | 0 |
+| `ttm.low_latency_alloc` | 2 | 0 |
 | `vm.lru_drain_timeout_ms` | 20 | (patch 0006 only) |
 | `vm.thp_direct_reclaim_split` | 1 | (patch 0008 only) |
 | `vm.lru_gen_defer_direct_aging` | 1 | (patch 0009 only) |
+| `vm.thp_shrinker_defer_direct` | 0 | (patch 0013 only) |
 | THP enabled / defrag | always / defer | Kconfig / madvise |
 | khugepaged defrag / alloc_sleep_millisecs | 0 / 2500 | 1 / 60000 |
 | khugepaged pages_to_scan / scan_sleep_millisecs | 8192 / 2500 | 4096 / 10000 |
@@ -115,7 +119,7 @@ games do them constantly) makes the kernel slow the program down on purpose.
 CPUs without split lock or bus lock detection are not affected either way.
 The `split_lock_detect=` boot parameter still overrides the default.
 
-Build defaults: GCC, `-march=native`, 1000 Hz, `PREEMPT` (full) with
+Build defaults: LLVM/Clang with ThinLTO, `-march=native`, 1000 Hz, `PREEMPT` (full) with
 PREEMPT_DYNAMIC, periodic tick, `performance` CPU governor, THP `always`,
 MGLRU on, cgroup `favordynmods` on (`CGROUP_FAVOR_DYNMODS`: starting a service
 or app no longer blocks fork/exec/exit system-wide while its process is moved
@@ -177,7 +181,7 @@ build.
 | `devwatch.sh` | find a misbehaving device: PSI irq/cpu/io/mem, busiest IRQ lines, busiest disks (busy %, wait, stuck requests), tasks blocked in D state with their kernel stack, new PCIe AER errors per device, busiest kernel threads, new kernel errors and USB disconnects (`sudo ./devwatch.sh 1`) |
 | `ipiwho.sh` | which kernel functions CPUs send each other (the `CAL` interrupts), from where and for which task, recorded for a few seconds via the `csd:csd_queue_cpu` tracepoint (`sudo ./ipiwho.sh 5`) |
 | `stallwho.bt` | bpftrace: every time a thread of one process is blocked in the kernel (D state) for longer than a threshold, with where it was blocked and **who woke it up**, with the waker's kernel stack. Shows which lock or background thread a game waited for (`sudo bpftrace tools/stallwho.bt <pid> [ms]`) |
-| `shrinkwho.bt` | bpftrace: times MGLRU aging, huge page splitting, zram compaction, the TTM pool shrinker and per-CPU page batch frees, split into kswapd and normal tasks; prints every call over 1 ms that a normal task had to do (`sudo bpftrace -o shrinkwho.log tools/shrinkwho.bt`) |
+| `shrinkwho.bt` | bpftrace: times MGLRU aging, huge page splitting (deferred split queue and shmem), zram compaction, the TTM pool shrinker and per-CPU page batch frees, split into kswapd and normal tasks; prints every call over 1 ms that a normal task had to do (`sudo bpftrace -o shrinkwho.log tools/shrinkwho.bt`) |
 | `readwho.bt` | bpftrace: for every `pread()` of 5 ms or longer, how much of it was direct reclaim and compaction by the reading thread, and for which allocation order (`sudo bpftrace -o readwho.log tools/readwho.bt`; traces `memstress`, the program name is set in the script) |
 | `compactwho.bt` | bpftrace: does kcompactd stall a program? Times kcompactd's `migrate_pages()` calls and how often and how long it is preempted inside one (the folios stay locked and unmapped meanwhile), the program's folio lock and migration entry waits, and for every `pread()` of 4 ms or longer how much was direct reclaim, direct compaction, blocked (by waker, with the kernel stack) or preempted (by whom) (`sudo bpftrace -o compactwho.log tools/compactwho.bt`; traces `memstress`, the program name is set in the script) |
 | `wqdelay.bt` | bpftrace: how long queued kernel work waits for a worker, per work function; prints every wait over 2 ms. Run it next to a game with all CPUs loaded to see whether GPU submission (`drm_sched_run_job_work`) and page flips (`commit_work`) are delayed (`sudo bpftrace -o wqdelay.log tools/wqdelay.bt`) |

@@ -2,10 +2,11 @@
 /*
  * shrinkwho.bt - who pays for reclaim side work, and for how long.
  *
- * Times five kernel paths that run when memory is short and shows whether
+ * Times six kernel paths that run when memory is short and shows whether
  * kswapd did the work or a normal task that happened to allocate:
  *   aging         MGLRU creating a new generation (page table walk)
  *   thp-split     splitting partially freed huge pages (deferred split)
+ *   shmem-split   splitting tmpfs/memfd huge pages past the end of their file
  *   zram-compact  zsmalloc compaction; holds a lock zram swap-ins need
  *   ttm-shrink    the GPU page pool shrinker (amdgpu, xe, nouveau)
  *   zone lock     returning a batch of per-CPU pages to the free lists
@@ -34,6 +35,13 @@ kretprobe:deferred_split_scan /@a[tid]/ {
 	if ($us > 1000 && comm != "kswapd0") { printf("%s thp-split %d us\n", comm, $us); }
 }
 
+kprobe:shmem_unused_huge_scan { @h[tid] = nsecs; }
+kretprobe:shmem_unused_huge_scan /@h[tid]/ {
+	$us = (uint64)(nsecs - @h[tid]) / 1000; delete(@h[tid]);
+	@shmem_split_us[comm == "kswapd0"] = hist($us);
+	if ($us > 1000 && comm != "kswapd0") { printf("%s shmem-split %d us\n", comm, $us); }
+}
+
 kprobe:zs_shrinker_scan { @b[tid] = nsecs; }
 kretprobe:zs_shrinker_scan /@b[tid]/ {
 	$us = (uint64)(nsecs - @b[tid]) / 1000; delete(@b[tid]);
@@ -53,4 +61,4 @@ kretprobe:free_pcppages_bulk /@s[tid]/ {
 	@zone_lock_us = hist((uint64)(nsecs - @s[tid]) / 1000); delete(@s[tid]);
 }
 
-END { clear(@a); clear(@b); clear(@c); clear(@s); clear(@t); }
+END { clear(@a); clear(@b); clear(@c); clear(@h); clear(@s); clear(@t); }

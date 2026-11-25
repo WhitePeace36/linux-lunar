@@ -26,10 +26,12 @@ _LUNAR_OPTIONS=(
 	_patch_filemap_large_folios _patch_boost_min_wmark _patch_ttm_low_latency
 	_patch_soft_defrag_mode _patch_kswapd_hopeless _patch_lru_drain_bounded
 	_patch_khugepaged_prio _patch_direct_reclaim_split _patch_lru_gen_defer_aging _patch_gpu_highpri_wq
+	_patch_boost_min_wmark_checks _patch_khugepaged_trylock _patch_thp_shrinker_defer
 	_default_defrag_mode _default_defrag_soft _default_watermark_scale_factor
 	_default_watermark_boost_factor _default_compaction_proactiveness
 	_default_swappiness _default_ttm_low_latency _default_lru_drain_timeout_ms
 	_default_thp_direct_reclaim_split _default_lru_gen_defer_direct_aging
+	_default_thp_shrinker_defer_direct
 	_default_dirty_bytes _default_dirty_background_bytes _default_dirty_writeback_centisecs
 	_default_dirty_expire_centisecs
 	_default_max_map_count _default_split_lock_detect _default_split_lock_mitigate
@@ -144,6 +146,19 @@ lunar_validate_options() {
 			_l_true "$_patch_lru_gen_defer_aging" \
 				|| _l_die "_default_lru_gen_defer_direct_aging=true needs _patch_lru_gen_defer_aging=true"
 		fi
+	fi
+	if [[ -n "$_default_thp_shrinker_defer_direct" ]]; then
+		_l_in "${_default_thp_shrinker_defer_direct,,}" true false yes no 1 0 \
+			|| _l_die "_default_thp_shrinker_defer_direct must be true or false"
+		if _l_true "$_default_thp_shrinker_defer_direct"; then
+			_l_true "$_patch_thp_shrinker_defer" \
+				|| _l_die "_default_thp_shrinker_defer_direct=true needs _patch_thp_shrinker_defer=true"
+		fi
+	fi
+	# 0011 finishes what 0002 starts; on its own it would make reclaim stop
+	# at a line the allocator does not use.
+	if _l_true "$_patch_boost_min_wmark_checks" && ! _l_true "$_patch_boost_min_wmark"; then
+		_l_die "_patch_boost_min_wmark_checks=true needs _patch_boost_min_wmark=true"
 	fi
 	[[ -z "$_default_dirty_bytes" ]] || _l_int_range "$_default_dirty_bytes" 8192 1099511627776 \
 		|| _l_die "_default_dirty_bytes must be 8192..1099511627776 (or empty)"
@@ -405,6 +420,11 @@ lunar_set_defaults() {
 		_l_msg2 "vm.lru_gen_defer_direct_aging = 1"
 		_l_set_line mm/vmscan.c '^static int sysctl_lru_gen_defer_direct_aging __read_mostly;$' \
 			'static int sysctl_lru_gen_defer_direct_aging __read_mostly = 1;'
+	fi
+	if [[ -n "$_default_thp_shrinker_defer_direct" ]] && _l_true "$_default_thp_shrinker_defer_direct"; then
+		_l_msg2 "vm.thp_shrinker_defer_direct = 1"
+		_l_set_line mm/vmscan.c '^static int sysctl_thp_shrinker_defer_direct __read_mostly;$' \
+			'static int sysctl_thp_shrinker_defer_direct __read_mostly = 1;'
 	fi
 	# Like writing vm.dirty_bytes / vm.dirty_background_bytes at runtime:
 	# the matching *_ratio becomes 0, so sysctl shows which one is in use.

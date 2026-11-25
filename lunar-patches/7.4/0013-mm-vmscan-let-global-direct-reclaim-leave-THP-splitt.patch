@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Timon Stipkovits <timon2201@gmail.com>
+Date: Wed, 25 Nov 2026 18:55:00 +0100
+Subject: [PATCH 13/13] mm/vmscan: let global direct reclaim leave THP-splitting
+ shrinkers to kswapd
+
+Two shrinkers free memory only by splitting transparent huge pages:
+
+- thp-deferred_split (deferred_split_scan()) splits partially unmapped
+  THPs, and, when khugepaged/max_ptes_none is below 511, THPs that
+  thp_underused() finds to be mostly zero pages. That check compares
+  the pages of each queued folio with the zero page one by one.
+
+- the tmpfs/shmem part of the superblock shrinker
+  (shmem_unused_huge_scan()) splits huge pages that reach past the end
+  of their file. With shmem_enabled=always every small memfd written
+  with write() or fallocate() has one.
+
+Both run from shrink_slab() in whichever task reclaims, including a
+game thread in direct reclaim. Splitting a mapped huge page unmaps and
+remaps it and flushes the TLB of the CPUs running that process. The
+task itself needs a few dozen pages, and kswapd, which the allocator
+woke before it entered direct reclaim, can do the splitting. This is
+the reasoning of 0008 (split instead of compressing 2 MiB in direct
+reclaim) and 0009 (leave optional MGLRU aging to kswapd), applied to
+the shrinkers.
+
+Add vm.thp_shrinker_defer_direct. When set, prepare_shrink_slab()
+marks the reclaim_state of a global direct reclaim pass, and both
+shrinkers check reclaim_defers_thp_split(): deferred_split_scan()
+returns SHRINK_STOP, so do_shrink_slab() carries the work over in
+nr_deferred and the next call (normally kswapd's) scans that much more;
+shmem_unused_huge_scan() reports nothing freed, because
+super_cache_scan() adds its return value to what the dentry and inode
+caches freed.
+
+do_shrink_slab() scales a shrinker's work by freeable >> priority. With
+the default batch of 128, the deferred split shrinker runs at priority
+12 only with about 260 000 queued THPs, and at priority 6 with about
+4 000. In practice these shrinkers therefore run in direct reclaim only
+after the priority has dropped, when that reclaim is already slow.
+Deferring at the first priorities only would do nothing. Defer at every
+priority except the last two passes (1 and 0), so the memory held by
+those huge pages still counts before the allocator decides on retries
+or OOM. Memcg reclaim (no kswapd to defer to), proactive reclaim and
+kswapd are unchanged.
+
+Not measured yet. Check first whether these shrinkers show up in game
+or audio threads at all: tools/shrinkwho.bt times both (thp-split and
+shmem-split, key 0 = not kswapd). The cost of deferring is
+that direct reclaim may evict other memory instead; compare
+thp_split_page, thp_deferred_split_page, pswpout and
+workingset_refault_* with the sysctl at 0 and 1.
+
+Default off.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ Documentation/admin-guide/sysctl/vm.rst | 24 +++++++++++++
+ include/linux/swap.h                    | 19 ++++++++++
+ mm/huge_memory.c                        |  9 +++++
+ mm/shmem.c                              | 10 ++++++
+ mm/vmscan.c                             | 46 +++++++++++++++++++++++++
+ 5 files changed, 108 insertions(+)
+
+diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
+index 813870e86..cc61e7df2 100644
+--- a/Documentation/admin-guide/sysctl/vm.rst
++++ b/Documentation/admin-guide/sysctl/vm.rst
+@@ -74,6 +74,7 @@ Currently, these files are in /proc/sys/vm:
+ - numa_stat
+ - swappiness
+ - thp_direct_reclaim_split
++- thp_shrinker_defer_direct
+ - unprivileged_userfaultfd
+ - user_reserve_kbytes
+ - vfs_cache_pressure
+@@ -1183,6 +1184,29 @@ thp_swpout_direct_split in /proc/vmstat counts the splits.
+ The default value is 0.
+ 
+ 
++thp_shrinker_defer_direct
++=========================
++
++When set to 1, global direct reclaim (an allocating task reclaiming
++memory itself) skips the two shrinkers that free memory only by splitting
++transparent huge pages, and leaves them to kswapd: the deferred split
++queue (partially unmapped huge pages, and huge pages that are mostly zero
++pages when khugepaged/max_ptes_none is below 511) and tmpfs/shmem (huge
++pages that reach past the end of their file). In the last two passes of
++a direct reclaim attempt (reclaim priority 1 and 0) it runs them as
++before, so that memory still counts before an allocation fails. Memory
++cgroup reclaim, proactive reclaim (memory.reclaim) and kswapd are not
++affected.
++
++Splitting a mapped huge page unmaps and remaps it and flushes the TLB of
++the CPUs running that process, in the task that happened to reclaim. Leaving
++the splits to kswapd can make direct reclaim take other memory instead;
++compare thp_split_page, thp_deferred_split_page, pswpout and
++workingset_refault_* in /proc/vmstat when changing this.
++
++The default value is 0.
++
++
+ unprivileged_userfaultfd
+ ========================
+ 
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 7d938a1ba..9986168f0 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -144,8 +144,27 @@ struct reclaim_state {
+ 	/* per-thread mm walk data */
+ 	struct lru_gen_mm_walk *mm_walk;
+ #endif
++	/*
++	 * Set by reclaim before it runs the shrinkers: shrinkers that free
++	 * memory only by splitting huge pages leave that to kswapd, see
++	 * reclaim_defers_thp_split().
++	 */
++	bool defer_thp_split;
+ };
+ 
++/*
++ * reclaim_defers_thp_split(): should a shrinker that frees memory by splitting
++ * huge pages skip this call?
++ *
++ * True in global direct reclaim, except in its last two passes, when
++ * vm.thp_shrinker_defer_direct is set; such a shrinker then returns
++ * SHRINK_STOP (or reports nothing freed) and its work is left to kswapd.
++ */
++static inline bool reclaim_defers_thp_split(void)
++{
++	return current->reclaim_state && current->reclaim_state->defer_thp_split;
++}
++
+ /*
+  * mm_account_reclaimed_pages(): account reclaimed pages outside of LRU-based
+  * reclaim
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 75e8641bf..2143a95a6 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -4767,6 +4767,15 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
+ 	int split = 0;
+ 	unsigned long isolated;
+ 
++	/*
++	 * Splitting is the only way this shrinker frees memory, and it is
++	 * expensive for the task that does it. Global direct reclaim may leave
++	 * it to kswapd; SHRINK_STOP keeps the work counted as deferred, so the
++	 * next call (normally kswapd's) scans that much more.
++	 */
++	if (reclaim_defers_thp_split())
++		return SHRINK_STOP;
++
+ 	isolated = list_lru_shrink_walk_irq(&deferred_split_lru, sc,
+ 					    deferred_split_isolate, &dispose);
+ 
+diff --git a/mm/shmem.c b/mm/shmem.c
+index e351cd425..735dc69e6 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -1054,6 +1054,16 @@ static long shmem_unused_huge_scan(struct super_block *sb,
+ 	if (!list_lru_shrink_count(&sbinfo->shrinklist, sc))
+ 		return SHRINK_STOP;
+ 
++	/*
++	 * This frees memory only by splitting huge pages beyond i_size; global
++	 * direct reclaim may leave that to kswapd (see
++	 * reclaim_defers_thp_split()). Report nothing freed rather than
++	 * SHRINK_STOP: super_cache_scan() adds the return value to what the
++	 * dentry and inode caches freed.
++	 */
++	if (reclaim_defers_thp_split())
++		return 0;
++
+ 	return shmem_unused_huge_shrink(sbinfo, sc, 0);
+ }
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index c5068db7a..fbb4b17d9 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1198,6 +1198,41 @@ static int sysctl_thp_direct_reclaim_split __read_mostly;
+  */
+ static int sysctl_lru_gen_defer_direct_aging __read_mostly;
+ 
++/*
++ * vm.thp_shrinker_defer_direct: global direct reclaim leaves the shrinkers
++ * that free memory only by splitting huge pages to kswapd, see
++ * prepare_shrink_slab().
++ */
++static int sysctl_thp_shrinker_defer_direct __read_mostly;
++
++/*
++ * Called before each shrink_slab() of a reclaim pass. Two shrinkers free
++ * memory only by splitting huge pages: the deferred split queue (partially
++ * mapped THPs, and THPs found to be mostly zero pages when
++ * khugepaged/max_ptes_none is below 511) and tmpfs/shmem (huge pages that
++ * reach past the end of their file). Splitting a mapped huge page unmaps and
++ * remaps it and flushes the TLB of the CPUs running that process, and the
++ * underused check compares the pages of a folio with the zero page one by one,
++ * all in the task that happened to reclaim. That task needs a few dozen pages,
++ * and kswapd, which the allocator woke before direct reclaim started, can do
++ * this work instead.
++ *
++ * do_shrink_slab() scales the work by freeable >> priority, so at the first
++ * priorities these shrinkers rarely run at all; they show up in direct reclaim
++ * once the priority has dropped, which is also when that reclaim already takes
++ * long. Only global direct reclaim defers, and not in the last two passes
++ * (priority 1 and 0): before the allocator gives up, the memory held by those
++ * huge pages counts again. Memcg reclaim (no kswapd to defer to) and proactive
++ * reclaim (not latency sensitive) are unchanged.
++ */
++static void prepare_shrink_slab(struct scan_control *sc)
++{
++	sc->reclaim_state.defer_thp_split =
++		READ_ONCE(sysctl_thp_shrinker_defer_direct) &&
++		!current_is_kswapd() && root_reclaim(sc) && !sc->proactive &&
++		sc->priority > 1;
++}
++
+ /*
+  * Swapping out a large anon folio to zram (or any synchronous swap device,
+  * or zswap) compresses every page of it in the reclaiming task: 3-4 ms for
+@@ -5440,6 +5475,7 @@ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
+ 
+ 	need_rotate = try_to_shrink_lruvec(lruvec, sc);
+ 
++	prepare_shrink_slab(sc);
+ 	shrink_slab(sc->gfp_mask, pgdat->node_id, memcg, sc->priority);
+ 
+ 	if (!sc->proactive)
+@@ -6567,6 +6603,7 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
+ 
+ 		shrink_lruvec(lruvec, sc);
+ 
++		prepare_shrink_slab(sc);
+ 		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
+ 			    sc->priority);
+ 
+@@ -8039,6 +8076,15 @@ static const struct ctl_table vmscan_sysctl_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_ONE,
+ 	},
++	{
++		.procname	= "thp_shrinker_defer_direct",
++		.data		= &sysctl_thp_shrinker_defer_direct,
++		.maxlen		= sizeof(sysctl_thp_shrinker_defer_direct),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
+ #ifdef CONFIG_NUMA
+ 	{
+ 		.procname	= "zone_reclaim_mode",
+-- 
+2.43.0
+

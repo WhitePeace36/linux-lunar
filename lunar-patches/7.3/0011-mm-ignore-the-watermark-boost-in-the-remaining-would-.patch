@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Timon Stipkovits <timon2201@gmail.com>
+Date: Wed, 25 Nov 2026 18:45:00 +0100
+Subject: [PATCH 11/13] mm: ignore the watermark boost in the remaining "would
+ the allocation succeed" checks
+
+Patch 0002 made zone_watermark_fast() ignore zone->watermark_boost when
+an allocation checks the min watermark, and allow_direct_reclaim() use
+the unboosted min watermark for the pfmemalloc reserve. Three checks
+that ask whether that same allocation would succeed still use
+min_wmark_pages(), which includes the boost:
+
+- should_reclaim_retry() decides whether the allocator keeps looping
+  through direct reclaim by asking whether free plus reclaimable pages
+  would meet the min watermark. With the boost the answer can be "no"
+  while the allocation itself, checked without the boost, would
+  succeed after reclaim; the allocator then stops retrying early and
+  heads for compaction retries or the OOM path.
+
+- should_continue_reclaim() stops reclaim/compaction (high-order
+  reclaim, direct and kswapd) once the allocation can already succeed.
+  With the boost that point is reached only min + boost pages later,
+  so a reclaimer keeps reclaiming after its allocation would already
+  have gone through.
+
+- compaction_ready() lets shrink_zones() skip reclaim of a zone when
+  the costly-order allocation can already succeed. With the boost it
+  says "reclaim first" in the same situation.
+
+While a boost is active (it is raised by every pageblock steal and
+worked off by kswapd), the last two make high-order direct reclaim run
+longer than the allocation needs, in the allocating task. Use the
+unboosted min watermark, zone->_watermark[WMARK_MIN], for these three
+checks, the same value zone_watermark_fast() now uses.
+
+should_continue_reclaim() also passes the watermark to
+compaction_suitable(). That one keeps the boosted value:
+compaction_suit_allocation_order() runs the same check with the boosted
+watermark before direct compaction starts, and stopping reclaim at a
+lower line would only make compaction return COMPACT_SKIPPED and send
+the allocator back into reclaim.
+
+Checks against the low and high watermarks, where the boost is meant to
+apply, and the order-0 margins compaction keeps for its migration
+targets are unchanged.
+
+Depends on "mm/page_alloc: don't apply watermark boost to the min
+watermark".
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ mm/page_alloc.c |  9 ++++++++-
+ mm/vmscan.c     | 18 ++++++++++++++----
+ 2 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 8d880204b..43e8ad909 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4678,7 +4678,14 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
+ 				ac->highest_zoneidx, ac->nodemask) {
+ 		unsigned long available;
+ 		unsigned long reclaimable;
+-		unsigned long min_wmark = min_wmark_pages(zone);
++		/*
++		 * The allocation attempts above check the min watermark
++		 * without the boost (see zone_watermark_fast()), so ask the
++		 * same question here: with the boost, a zone whose free plus
++		 * reclaimable pages would satisfy the allocation could be
++		 * given up on while the boost is still being worked off.
++		 */
++		unsigned long min_wmark = zone->_watermark[WMARK_MIN];
+ 		bool wmark;
+ 
+ 		if (cpusets_enabled() &&
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index ee28f7747..d3a7ef016 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -6258,8 +6258,15 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
+ 	for_each_managed_zone_pgdat(zone, pgdat, z, sc->reclaim_idx) {
+ 		unsigned long watermark = min_wmark_pages(zone);
+ 
+-		/* Allocation can already succeed, nothing to do */
+-		if (zone_watermark_ok(zone, sc->order, watermark,
++		/*
++		 * Allocation can already succeed, nothing to do. The
++		 * allocator ignores the boost at the min watermark (see
++		 * zone_watermark_fast()), so do the same here. The
++		 * compaction_suitable() check below keeps the boosted value
++		 * to match the check compaction itself makes before it runs.
++		 */
++		if (zone_watermark_ok(zone, sc->order,
++				      zone->_watermark[WMARK_MIN],
+ 				      sc->reclaim_idx, 0))
+ 			return false;
+ 
+@@ -6484,8 +6491,11 @@ static inline bool compaction_ready(struct zone *zone, struct scan_control *sc)
+ 	if (!gfp_compaction_allowed(sc->gfp_mask))
+ 		return false;
+ 
+-	/* Allocation can already succeed, nothing to do */
+-	if (zone_watermark_ok(zone, sc->order, min_wmark_pages(zone),
++	/*
++	 * Allocation can already succeed, nothing to do. Like the allocator
++	 * (see zone_watermark_fast()), ignore the boost at the min watermark.
++	 */
++	if (zone_watermark_ok(zone, sc->order, zone->_watermark[WMARK_MIN],
+ 			      sc->reclaim_idx, 0))
+ 		return true;
+ 
+-- 
+2.43.0
+

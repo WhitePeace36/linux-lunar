@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Timon Stipkovits <timon2201@gmail.com>
+Date: Wed, 25 Nov 2026 18:50:00 +0100
+Subject: [PATCH 12/13] mm/khugepaged: don't queue for mmap_lock in write mode
+
+An anonymous collapse takes mmap_lock in write mode in
+collapse_huge_page(), after the folio is allocated and the range is
+revalidated under the read lock. mmap_write_lock() waits behind every
+current holder. While it waits, later users of the lock in that
+process queue behind it: mmap(), mprotect() and munmap() of every
+thread, and page faults that cannot use the per-VMA lock. Once
+khugepaged has the lock, they then also wait for the collapse itself,
+which includes the TLB flush of the PMD and the copy of up to 2 MiB.
+
+Games under Wine/Proton call mmap() and mprotect() all the time from
+several threads, so a khugepaged that queues as a writer makes them
+wait for whoever holds the lock first and for khugepaged after that.
+Patch 0007 (khugepaged no longer at MAX_NICE) shortens the second
+part; this patch removes the first.
+
+khugepaged already avoids waiting for this lock when it picks an mm
+(khugepaged_scan_mm_slot() uses mmap_read_trylock() "to avoid long
+wait times"). Do the same for the write lock: when
+cc->is_khugepaged is set, collapse_huge_page() tries mmap_write_trylock()
+up to three times, one jiffy apart, and otherwise gives up with the
+new result SCAN_MMAP_LOCK_BUSY. The few tries are there because the
+folio is already allocated (possibly after compaction) and is freed
+when the collapse gives up.
+
+On SCAN_MMAP_LOCK_BUSY collapse_anon() stops trying other orders in
+that PMD (the default case), khugepaged's scan address has already
+moved past it, and the range is retried on the next pass over the mm.
+MADV_COLLAPSE (is_khugepaged false) still waits for the lock, so
+its behaviour is unchanged; madvise_collapse_errno() maps the new
+result to -EAGAIN for completeness.
+
+The new result is visible in the mm_collapse_huge_page tracepoint
+(status=mmap_lock_busy). If it shows up often for one process, that
+process holds mmap_lock most of the time and its ranges are collapsed
+less often.
+
+Not covered: the collapse still holds the lock in write mode while it
+works, and khugepaged still takes the read lock normally to revalidate
+and swap in.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ include/trace/events/huge_memory.h |  3 ++-
+ mm/khugepaged.c                    | 39 +++++++++++++++++++++++++++++-
+ 2 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/include/trace/events/huge_memory.h b/include/trace/events/huge_memory.h
+index 5a48c5406..a765b8a6d 100644
+--- a/include/trace/events/huge_memory.h
++++ b/include/trace/events/huge_memory.h
+@@ -39,7 +39,8 @@
+ 	EM( SCAN_STORE_FAILED,		"store_failed")			\
+ 	EM( SCAN_COPY_MC,		"copy_poisoned_page")		\
+ 	EM( SCAN_PAGE_FILLED,		"page_filled")			\
+-	EMe(SCAN_PAGE_DIRTY_OR_WRITEBACK, "page_dirty_or_writeback")
++	EM( SCAN_PAGE_DIRTY_OR_WRITEBACK, "page_dirty_or_writeback")	\
++	EMe(SCAN_MMAP_LOCK_BUSY,	"mmap_lock_busy")
+ 
+ #undef EM
+ #undef EMe
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 656ba2de5..eb9c31e95 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -63,6 +63,7 @@ enum scan_result {
+ 	SCAN_COPY_MC,
+ 	SCAN_PAGE_FILLED,
+ 	SCAN_PAGE_DIRTY_OR_WRITEBACK,
++	SCAN_MMAP_LOCK_BUSY,
+ };
+ 
+ #define CREATE_TRACE_POINTS
+@@ -1278,6 +1279,38 @@ static enum scan_result alloc_charge_folio(struct folio **foliop, struct mm_stru
+ 	return SCAN_SUCCEED;
+ }
+ 
++/* How often khugepaged tries for mmap_lock in write mode, one jiffy apart */
++#define COLLAPSE_MMAP_WRITE_TRIES	3
++
++/*
++ * Take mmap_lock in write mode for an anonymous collapse. mmap_write_lock()
++ * waits behind the current holders, and while it waits, later users of the
++ * lock in that process (mmap(), mprotect(), munmap(), page faults that cannot
++ * use the per-VMA lock) queue behind it, on top of waiting for the collapse
++ * itself. khugepaged collapses on its own initiative and comes back to this
++ * range on its next pass over the mm, so it takes the lock only when it is
++ * free and gives up after a few tries. The folio is already allocated at this
++ * point, which is why it does not give up on the first try. MADV_COLLAPSE was
++ * asked for and waits for the lock as before.
++ */
++static bool collapse_mmap_write_lock(struct mm_struct *mm,
++				     struct collapse_control *cc)
++{
++	int tries = COLLAPSE_MMAP_WRITE_TRIES;
++
++	if (!cc->is_khugepaged) {
++		mmap_write_lock(mm);
++		return true;
++	}
++
++	while (!mmap_write_trylock(mm)) {
++		if (!--tries)
++			return false;
++		schedule_timeout_idle(1);
++	}
++	return true;
++}
++
+ /*
+  * collapse_huge_page() expects the mmap_lock to be unlocked before entering and
+  * will always return with the lock unlocked, to avoid holding the mmap_lock
+@@ -1345,7 +1378,10 @@ static enum scan_result collapse_huge_page(struct mm_struct *mm, unsigned long s
+ 	 * UFFDIO_MOVE is prevented to race as well thanks to the
+ 	 * mmap_lock.
+ 	 */
+-	mmap_write_lock(mm);
++	if (!collapse_mmap_write_lock(mm, cc)) {
++		result = SCAN_MMAP_LOCK_BUSY;
++		goto out_nolock;
++	}
+ 	result = hugepage_vma_revalidate(mm, pmd_addr, /*expect_anon=*/ true,
+ 					 &vma, cc, order);
+ 	if (result != SCAN_SUCCEED)
+@@ -3183,6 +3219,7 @@ static int madvise_collapse_errno(enum scan_result r)
+ 	case SCAN_PAGE_FILLED:
+ 	case SCAN_PAGE_HAS_PRIVATE:
+ 	case SCAN_PAGE_DIRTY_OR_WRITEBACK:
++	case SCAN_MMAP_LOCK_BUSY:
+ 		return -EAGAIN;
+ 	/*
+ 	 * Other: Trying again likely not to succeed / error intrinsic to
+-- 
+2.43.0
+
