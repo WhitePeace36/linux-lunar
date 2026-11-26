@@ -2,6 +2,8 @@
  * sudtrap: cost of one Syscall User Dispatch trap, the way Wine pays it for
  * every Windows-style syscall stub that reaches a real `syscall`.
  *
+ *   clock      clock_gettime(CLOCK_MONOTONIC_RAW), what Wine's QPC costs
+ *              (~1000 ns instead of ~20 means the HPET: see tools/clockcheck.sh)
  *   native     getpid through SYSCALL/SYSRET (the floor)
  *   sigsys     SUD -> SIGSYS -> handler -> rt_sigreturn (stock kernels)
  *   upcall     SUD -> handler, return address in %rcx, IRET exit (patch 0014)
@@ -122,6 +124,13 @@ int main(int argc, char **argv)
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 	sigaction(SIGSYS, &sa, NULL);
+
+	t = now();
+	for (i = 0; i < iters; i++) {
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+	}
+	printf("%-12s %8.1f ns\n", "clock", (now() - t) / iters);
 
 	t = now();
 	for (i = 0; i < iters; i++)

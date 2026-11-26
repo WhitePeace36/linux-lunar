@@ -13,3 +13,4 @@ _patch_boost_min_wmark_checks 0011-mm-ignore-the-watermark-boost-in-the-remainin
 _patch_khugepaged_trylock     0012-mm-khugepaged-don-t-queue-for-mmap_lock-in-write-mode.patch
 _patch_thp_shrinker_defer     0013-mm-vmscan-let-global-direct-reclaim-leave-THP-splitt.patch
 _patch_sud_upcall             0014-entry-Add-a-direct-upcall-mode-to-Syscall-User-Dispa.patch
+_patch_tsc_zen_nowatchdog     0015-x86-tsc-Don-t-watchdog-the-TSC-on-single-socket-AMD-.patch

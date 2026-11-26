@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Timon Stipkovits <timon2201@gmail.com>
+Date: Thu, 26 Nov 2026 16:00:00 +0100
+Subject: [PATCH 15/15] x86/tsc: Don't watchdog the TSC on single-socket AMD Zen
+
+Since commit b50db7095fe0 ("x86/tsc: Disable clocksource watchdog for
+TSC on qualified platorms") the clocksource watchdog leaves the TSC
+alone when the CPU has a constant, non-stop TSC and TSC_ADJUST.  AMD
+added TSC_ADJUST with Zen 5, so on Zen 1-4 the watchdog keeps comparing
+the TSC against the HPET or the ACPI PM timer, and Ryzen systems
+regularly lose the TSC to it: "Marking clocksource 'tsc' as unstable
+because the skew is too large", then the HPET for the rest of the boot.
+
+That is expensive for games.  With the HPET every clock_gettime() falls
+back from the vDSO to a syscall and an HPET read; under Wine each of
+those syscalls is also caught by Syscall User Dispatch.  On a Ryzen 9
+7950X3D running THE FINALS this showed up as 1.2-1.6 million trapped
+syscalls a second on boots where the TSC had been rejected, against
+~200k a second otherwise (CachyOS/proton-cachyos#322).
+
+Apply the same trust to AMD and Hygon family 0x17 and later with a
+constant and non-stop TSC, on a single package, outside a VM.  The TSC
+synchronization check at CPU bringup still runs (it does not depend on
+the watchdog), so TSCs that really disagree are still caught, and
+tsc=watchdog turns the watchdog back on.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/x86/kernel/tsc.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
+index 723347e2c..b37e83bd3 100644
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@ -1245,6 +1245,26 @@ static void __init check_system_tsc_reliable(void)
+ 	    boot_cpu_has(X86_FEATURE_TSC_ADJUST) &&
+ 	    topology_max_packages() <= 4)
+ 		tsc_disable_clocksource_watchdog();
++
++	/*
++	 * AMD added TSC_ADJUST with Zen 5, so the rule above never covers
++	 * Zen 1-4, and there the watchdog keeps comparing the TSC against
++	 * the HPET or the ACPI PM timer.  Under load, or with a read of the
++	 * slow watchdog clock delayed, it decides the skew is too large and
++	 * switches the whole system to the HPET for good, which makes every
++	 * clock_gettime() a syscall and an HPET read.  On a single package
++	 * with an invariant TSC, trust it like the rule above does: the TSC
++	 * synchronization check at CPU bringup still runs, and tsc=watchdog
++	 * turns the watchdog back on.
++	 */
++	if ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD ||
++	     boot_cpu_data.x86_vendor == X86_VENDOR_HYGON) &&
++	    boot_cpu_data.x86 >= 0x17 &&
++	    boot_cpu_has(X86_FEATURE_CONSTANT_TSC) &&
++	    boot_cpu_has(X86_FEATURE_NONSTOP_TSC) &&
++	    !boot_cpu_has(X86_FEATURE_HYPERVISOR) &&
++	    topology_max_packages() == 1)
++		tsc_disable_clocksource_watchdog();
+ }
+ 
+ /*

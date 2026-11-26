@@ -7,7 +7,13 @@
 #       validation and the ptrace round trip (x86-64 and non-x86 builds)
 #   make wine WINE=<dlls/ntdll/unix/signal_x86_64.c with the Wine patch>
 #       runs both Wine entry points the way the kernel enters them and checks
-#       the syscall frame, the registers and the red zone
+#       the syscall frame, the registers and the red zone; then runs the
+#       NtQueryPerformanceCounter fast path against Wine's real dispatcher
+#       (result, every non-volatile register, fallbacks)
+#   make bench WINE=<same file>
+#       user-side cost of one trapped NtQueryPerformanceCounter: the Unix
+#       function alone, Wine's normal syscall path, the upcall path and the
+#       fast path (the kernel part of the trap is not included)
 CFLAGS = -O2 -Wall -Wextra -Wno-unused-parameter -Werror
 MOCK = -I gen -I mock -include mock/mock.h
 
@@ -32,12 +38,22 @@ kernel: gen
 wine:
 	@test -n "$(WINE)" || { echo "set WINE"; exit 1; }
 	@mkdir -p gen
-	python3 extract_handlers.py $(WINE) > gen/handlers.inc
+	python3 extract_handlers.py $(WINE) handlers > gen/handlers.inc
+	python3 extract_handlers.py $(WINE) dispatcher > gen/dispatcher.inc
 	$(CC) -O2 -Wall -I gen test_upcall.c -o gen/test_upcall
+	$(CC) -O2 -mno-red-zone -Wall -Wno-unused-function -I gen test_fastqpc.c -o gen/test_fastqpc
 	gen/test_upcall
+	gen/test_fastqpc
+
+bench:
+	@test -n "$(WINE)" || { echo "set WINE"; exit 1; }
+	@mkdir -p gen
+	python3 extract_handlers.py $(WINE) dispatcher > gen/dispatcher.inc
+	$(CC) -O2 -mno-red-zone -Wall -Wno-unused-function -I gen bench_qpc.c -o gen/bench_qpc
+	gen/bench_qpc
 
 clean:
 	rm -rf gen
 
 FORCE:
-.PHONY: all kernel wine clean FORCE
+.PHONY: all kernel wine bench clean FORCE

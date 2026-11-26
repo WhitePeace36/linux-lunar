@@ -14,6 +14,10 @@
 #include <unistd.h>
 
 int syscall_dispatch_enabled = 1;
+char __wine_sud_fast_qpc;			/* fast path off here, see test_fastqpc.c */
+unsigned int __wine_sud_fast_qpc_id = ~0u;
+void *__wine_sud_fast_qpc_func;
+__asm__(".text\n.globl __wine_syscall_dispatcher_return\n__wine_syscall_dispatcher_return:\n ud2\n");
 
 struct regs { uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rsp, flags; };
 struct regs seen;		/* filled by the stubs below */
