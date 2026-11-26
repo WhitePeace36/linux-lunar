@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: FurryMileon <furrymileon@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 15:00:00 +0100
-Subject: [PATCH 14/16] entry: Add a direct-upcall mode to Syscall User Dispatch
+Subject: [PATCH 14/16] entry: Add a direct-upcall mode to Syscall User
+ Dispatch
 
 Syscall User Dispatch delivers every blocked syscall as SIGSYS.  Wine
 relies on it for Windows-style syscall stubs, and some Windows games
@@ -71,19 +72,19 @@ handler flags argument, documentation of the handler's entry state
 
 Assisted-by: Claude:claude-opus-5-5
 ---
- .../admin-guide/syscall-user-dispatch.rst     |  60 ++++++-
+ .../admin-guide/syscall-user-dispatch.rst     |  61 +++++++-
  include/linux/syscall_user_dispatch.h         |  25 ++-
  include/linux/syscall_user_dispatch_types.h   |   3 +
  include/uapi/linux/prctl.h                    |  26 +++
  kernel/entry/syscall_user_dispatch.c          | 148 +++++++++++++++++-
  kernel/sys.c                                  |   5 +
- 6 files changed, 258 insertions(+), 9 deletions(-)
+ 6 files changed, 259 insertions(+), 9 deletions(-)
 
 diff --git a/Documentation/admin-guide/syscall-user-dispatch.rst b/Documentation/admin-guide/syscall-user-dispatch.rst
-index c1768d9e8..5a051a4a6 100644
+index c1768d9e8..a0b80dbd7 100644
 --- a/Documentation/admin-guide/syscall-user-dispatch.rst
 +++ b/Documentation/admin-guide/syscall-user-dispatch.rst
-@@ -82,6 +82,64 @@ Additionally, a tasks syscall user dispatch configuration can be peeked
+@@ -82,6 +82,65 @@ Additionally, a tasks syscall user dispatch configuration can be peeked
  and poked via the PTRACE_(GET|SET)_SYSCALL_USER_DISPATCH_CONFIG ptrace
  requests. This is useful for checkpoint/restart software.
  
@@ -117,9 +118,10 @@ index c1768d9e8..5a051a4a6 100644
 +is armed fails with EBUSY, and the handler is reset together with the
 +rest of the configuration on clone and exec, so every new thread has to
 +register it again.  PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG reports
-+PR_SYS_DISPATCH_UPCALL_EXCLUSIVE_ON for tasks in upcall mode; the handler
-+itself is not part of the ptrace configuration, so a restored task must
-+register it before the configuration can be applied.
++PR_SYS_DISPATCH_UPCALL_EXCLUSIVE_ON or PR_SYS_DISPATCH_UPCALL_INCLUSIVE_ON
++for tasks in upcall mode; the handler itself is not part of the ptrace
++configuration, so a restored task must register it before the
++configuration can be applied.
 +
 +The handler runs with the RFLAGS of the syscall site, so it cannot rely on
 +DF being clear.  Like any indirect branch target it should start with
@@ -148,7 +150,7 @@ index c1768d9e8..5a051a4a6 100644
  Security Notes
  --------------
  
-@@ -96,4 +154,4 @@ address and modify the selector value.  If the use case requires any
+@@ -96,4 +155,4 @@ address and modify the selector value.  If the use case requires any
  kind of security sandboxing, Seccomp should be used instead.
  
  Any fork or exec of the existing process resets the mechanism to

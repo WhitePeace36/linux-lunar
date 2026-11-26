@@ -43,7 +43,7 @@ Assisted-by: Claude:claude-opus-5-5
  #define PR_SYS_DISPATCH_ON           1
  #endif
  
-+/* Syscall User Dispatch direct-upcall extension (CachyOS kernels).  The
++/* Syscall User Dispatch direct-upcall extension (CachyOS/linux#15, lunar).  The
 + * option number is a magic value and the mode carries bit 31, so kernels
 + * without the extension return EINVAL and we stay on the SIGSYS path. */
 +#ifndef PR_SYS_DISPATCH_UPCALL_EXCLUSIVE_ON

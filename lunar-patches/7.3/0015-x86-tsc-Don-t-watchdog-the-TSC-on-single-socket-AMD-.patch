@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Timon Stipkovits <timon2201@gmail.com>
 Date: Thu, 26 Nov 2026 16:00:00 +0100
-Subject: [PATCH 15/16] x86/tsc: Don't watchdog the TSC on single-socket AMD Zen
+Subject: [PATCH 15/16] x86/tsc: Don't watchdog the TSC on single-socket AMD
+ Zen
 
 Since commit b50db7095fe0 ("x86/tsc: Disable clocksource watchdog for
 TSC on qualified platorms") the clocksource watchdog leaves the TSC
@@ -18,22 +19,26 @@ those syscalls is also caught by Syscall User Dispatch.  On a Ryzen 9
 syscalls a second on boots where the TSC had been rejected, against
 ~200k a second otherwise (CachyOS/proton-cachyos#322).
 
-Apply the same trust to AMD and Hygon family 0x17 and later with a
-constant and non-stop TSC, on a single package, outside a VM.  The TSC
+Turn the watchdog off for AMD and Hygon family 0x17 and later with a
+constant and non-stop TSC, on a single package, outside a VM.  This is
+weaker than the TSC_ADJUST rule: without TSC_ADJUST the kernel cannot
+notice firmware writing the TSC at runtime, and the watchdog is what
+would have caught that, so a system with such firmware would keep a
+wrong clock instead of falling back to the HPET.  The TSC
 synchronization check at CPU bringup still runs (it does not depend on
-the watchdog), so TSCs that really disagree are still caught, and
+the watchdog), so TSCs that disagree between CPUs are still caught, and
 tsc=watchdog turns the watchdog back on.
 
 Assisted-by: Claude:claude-opus-5-5
 ---
- arch/x86/kernel/tsc.c | 20 ++++++++++++++++++++
- 1 file changed, 20 insertions(+)
+ arch/x86/kernel/tsc.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
 
 diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
-index 723347e2c..b37e83bd3 100644
+index 723347e2c..cc9f20455 100644
 --- a/arch/x86/kernel/tsc.c
 +++ b/arch/x86/kernel/tsc.c
-@@ -1245,6 +1245,26 @@ static void __init check_system_tsc_reliable(void)
+@@ -1245,6 +1245,29 @@ static void __init check_system_tsc_reliable(void)
  	    boot_cpu_has(X86_FEATURE_TSC_ADJUST) &&
  	    topology_max_packages() <= 4)
  		tsc_disable_clocksource_watchdog();
@@ -44,8 +49,11 @@ index 723347e2c..b37e83bd3 100644
 +	 * the HPET or the ACPI PM timer.  Under load, or with a read of the
 +	 * slow watchdog clock delayed, it decides the skew is too large and
 +	 * switches the whole system to the HPET for good, which makes every
-+	 * clock_gettime() a syscall and an HPET read.  On a single package
-+	 * with an invariant TSC, trust it like the rule above does: the TSC
++	 * clock_gettime() a syscall and an HPET read.
++	 *
++	 * Without TSC_ADJUST the kernel cannot notice firmware writing the
++	 * TSC at runtime, and the watchdog is what would catch it.  On a
++	 * single package with an invariant TSC accept that risk: the TSC
 +	 * synchronization check at CPU bringup still runs, and tsc=watchdog
 +	 * turns the watchdog back on.
 +	 */

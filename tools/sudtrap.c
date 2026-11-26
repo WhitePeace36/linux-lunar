@@ -38,7 +38,8 @@
 #define PR_SET_SYSCALL_USER_DISPATCH_HANDLER 0x53554448
 #define PR_SYS_DISPATCH_HANDLER_PUSH_RET (1UL << 0)
 
-#define FAKE_NR 0x1d	/* the "Windows" syscall number, any value works */
+#define FAKE_NR 0x3fff	/* the "Windows" syscall number: one Linux does not have, so a
+			   syscall that is not trapped returns -ENOSYS and does nothing */
 #define RESULT 0x4242	/* what the handlers return for it */
 
 static volatile char selector = SYSCALL_DISPATCH_FILTER_ALLOW;

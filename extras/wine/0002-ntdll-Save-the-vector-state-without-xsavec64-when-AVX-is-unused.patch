@@ -19,8 +19,8 @@ stores the latter only with an exception pending.
 In a benchmark of the real dispatcher this takes a syscall from ~66 to
 ~47 ns.  It applies to every NT syscall, normal ones and those trapped
 by Syscall User Dispatch alike (unix calls already save only %xmm6-15).
-Needs XSAVEC and XGETBV with ECX = 1 (Zen and Intel since Skylake);
-WINE_DISABLE_FAST_XSAVE=1 turns it off.
+Used when CPUID reports XSAVEC and XGETBV with ECX = 1, checked at
+startup; WINE_DISABLE_FAST_XSAVE=1 turns it off.
 
 Also fix the xsavec64 path: xsavec64 does not store the SSE registers
 when they are all zero (init optimization), but the return path reloads

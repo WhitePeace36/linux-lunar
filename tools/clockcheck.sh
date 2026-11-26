@@ -28,9 +28,11 @@ events=$(grep -E "Marking clocksource 'tsc|Marking TSC unstable|TSC warp|TSC syn
 echo
 if [[ "$cur" == tsc ]]; then
 	echo "OK: timing with the TSC."
-	[[ $(has tsc_adjust) == no && $(has constant_tsc) == yes && $(has nonstop_tsc) == yes ]] &&
-		echo "Note: no TSC_ADJUST (AMD before Zen 5), so the clocksource watchdog still checks the TSC" \
-		     "and can switch to the HPET later. linux-lunar patch 0015 turns it off on single-socket Zen."
+	vendor=$(grep -m1 '^vendor_id' /proc/cpuinfo | awk '{print $3}')
+	[[ $(has tsc_adjust) == no && $(has constant_tsc) == yes && $(has nonstop_tsc) == yes &&
+	   $(has hypervisor) == no && ( $vendor == AuthenticAMD || $vendor == HygonGenuine ) ]] &&
+		echo "Note: no TSC_ADJUST (AMD before Zen 5), so unless this kernel has linux-lunar patch 0015" \
+		     "the clocksource watchdog keeps checking the TSC and can still switch to the HPET later."
 elif grep -q "check_tsc_sync_source failed\|TSC warp" <<<"$events"; then
 	echo "The TSCs of different CPUs disagree (synchronization check at CPU bringup)."
 	echo "That is a firmware/hardware problem, a BIOS update may fix it. Patch 0015 does not change this check."
