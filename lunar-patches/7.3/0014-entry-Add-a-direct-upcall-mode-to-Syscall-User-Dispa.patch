@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: FurryMileon <furrymileon@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 15:00:00 +0100
-Subject: [PATCH 14/15] entry: Add a direct-upcall mode to Syscall User Dispatch
+Subject: [PATCH 14/16] entry: Add a direct-upcall mode to Syscall User Dispatch
 
 Syscall User Dispatch delivers every blocked syscall as SIGSYS.  Wine
 relies on it for Windows-style syscall stubs, and some Windows games

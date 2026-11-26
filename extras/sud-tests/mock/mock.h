@@ -88,6 +88,10 @@ static inline void force_exit_sig(int sig) { mock_exit_sig = sig; }
 #define syscall_get_arch(t) 0xc000003eU
 #define syscall_get_nr(t, r) ((int)(r)->orig_ax)
 #define syscall_rollback(t, r) ((r)->ax = (r)->orig_ax)
-#define arch_syscall_is_vdso_sigreturn(r) false
+extern bool mock_vdso_sigreturn;
+extern int mock_vdso_checks;
+static inline bool arch_syscall_is_vdso_sigreturn(struct pt_regs *r) { mock_vdso_checks++; return mock_vdso_sigreturn; }
+#define scoped_user_read_access(p, elbl) for (int __once = 1; __once; __once = 0)
+#define unsafe_get_user(x, p, elbl) do { if (mock_faults(p)) goto elbl; (x) = *(p); } while (0)
 
 struct ptrace_sud_config { __u64 mode, selector, offset, len; };

@@ -7,7 +7,7 @@
  *   direct     the Unix NtQueryPerformanceCounter itself (clock_gettime)
  *   stub       Wine's normal path: stub -> __wine_syscall_dispatcher
  *   upcall     what follows an SUD trap with PUSH_RET: upcall_push -> dispatcher
- *   fast       the same with the WINE_SUD_FAST_QPC=1 fast path
+ * "+" = the same with the XINUSE-guided save instead of xsavec64
  */
 #define _GNU_SOURCE
 #include <cpuid.h>
@@ -31,9 +31,8 @@
 #define __ASM_GLOBAL_FUNC(name, code) __asm__(".text\n.globl " #name "\n" #name ":\n" code);
 
 int syscall_dispatch_enabled = 1;
-char __wine_sud_fast_qpc;
-unsigned int __wine_sud_fast_qpc_id = ~0u;
-void *__wine_sud_fast_qpc_func;
+char xinuse_fast_save;
+unsigned int xinuse_mxcsr_mask = 0xffbf;
 void trace_syscall(void) { abort(); }
 void trace_sysret(void) { abort(); }
 
@@ -140,15 +139,17 @@ int main(void)
 	memcpy(teb + 0x378, &frame, 8);
 	if (syscall(SYS_arch_prctl, ARCH_SET_GS, teb)) { perror("ARCH_SET_GS"); return 1; }
 
-	printf("XSAVEC %s\n", (a & 2) ? "yes" : "no");
-	for (int r = 0; r < 4; r++) {
+	printf("XSAVEC %s, XGETBV(1) %s\n", (a & 2) ? "yes" : "no", (a & 4) ? "yes" : "no");
+	unsigned short cw = 0x27f;		/* Windows default x87 control word */
+	__asm__ volatile("fldcw %0" :: "m"(cw));
+	for (int r = 0; r < 3; r++) {
 		BENCH("direct", fake_NtQueryPerformanceCounter(&c, &f));
+		xinuse_fast_save = 0;
 		BENCH("stub", via_stub(&c, &f));
 		BENCH("upcall", via_upcall(&c, &f));
-		__wine_sud_fast_qpc = 1; __wine_sud_fast_qpc_id = QPC_ID;
-		__wine_sud_fast_qpc_func = (void *)fake_NtQueryPerformanceCounter;
-		BENCH("fast", via_upcall(&c, &f));
-		__wine_sud_fast_qpc = 0; __wine_sud_fast_qpc_id = ~0u;
+		xinuse_fast_save = 1;
+		BENCH("stub+", via_stub(&c, &f));
+		BENCH("upcall+", via_upcall(&c, &f));
 	}
 	return 0;
 }

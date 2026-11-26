@@ -7,13 +7,15 @@
 #       validation and the ptrace round trip (x86-64 and non-x86 builds)
 #   make wine WINE=<dlls/ntdll/unix/signal_x86_64.c with the Wine patch>
 #       runs both Wine entry points the way the kernel enters them and checks
-#       the syscall frame, the registers and the red zone; then runs the
-#       NtQueryPerformanceCounter fast path against Wine's real dispatcher
-#       (result, every non-volatile register, fallbacks)
+#       the syscall frame, the registers and the red zone (Wine patch 1);
+#       then runs Wine's real dispatcher in several x87/SSE/AVX states with
+#       xsavec64 and with the XINUSE-guided save and compares what
+#       NtGetContextThread would report and what the caller gets back
+#       (Wine patch 2)
 #   make bench WINE=<same file>
-#       user-side cost of one trapped NtQueryPerformanceCounter: the Unix
-#       function alone, Wine's normal syscall path, the upcall path and the
-#       fast path (the kernel part of the trap is not included)
+#       user-side cost of one NtQueryPerformanceCounter: the Unix function
+#       alone, Wine's normal syscall path and the SUD upcall path, each with
+#       xsavec64 and with the XINUSE-guided save (kernel part not included)
 CFLAGS = -O2 -Wall -Wextra -Wno-unused-parameter -Werror
 MOCK = -I gen -I mock -include mock/mock.h
 
@@ -27,9 +29,12 @@ gen: FORCE
 	@echo '#include "$(abspath $(KSRC))/include/linux/syscall_user_dispatch.h"' > gen/linux/syscall_user_dispatch.h
 	@echo '#include "$(abspath $(KSRC))/include/linux/syscall_user_dispatch_types.h"' > gen/linux/syscall_user_dispatch_types.h
 
+# patch 0016 reads the selector before the vDSO sigreturn check
+SELFIRST = $(shell grep -q 'scoped_user_read_access.selector' $(KSRC)/kernel/entry/syscall_user_dispatch.c 2>/dev/null && echo -DSELECTOR_FIRST)
+
 kernel: gen
 	$(CC) $(CFLAGS) $(MOCK) -DCONFIG_X86_64=1 -c $(KSRC)/kernel/entry/syscall_user_dispatch.c -o gen/sud.o
-	$(CC) $(CFLAGS) $(MOCK) -DCONFIG_X86_64=1 test_sud.c gen/sud.o -o gen/test_sud
+	$(CC) $(CFLAGS) $(MOCK) $(SELFIRST) -DCONFIG_X86_64=1 test_sud.c gen/sud.o -o gen/test_sud
 	$(CC) $(CFLAGS) $(MOCK) -c $(KSRC)/kernel/entry/syscall_user_dispatch.c -o gen/sud_nox86.o
 	$(CC) $(CFLAGS) $(MOCK) nox86.c gen/sud_nox86.o -o gen/nox86
 	gen/test_sud
@@ -41,9 +46,9 @@ wine:
 	python3 extract_handlers.py $(WINE) handlers > gen/handlers.inc
 	python3 extract_handlers.py $(WINE) dispatcher > gen/dispatcher.inc
 	$(CC) -O2 -Wall -I gen test_upcall.c -o gen/test_upcall
-	$(CC) -O2 -mno-red-zone -Wall -Wno-unused-function -I gen test_fastqpc.c -o gen/test_fastqpc
+	$(CC) -O2 -mno-red-zone -Wall -Wno-unused-function -I gen test_xsave.c -o gen/test_xsave
 	gen/test_upcall
-	gen/test_fastqpc
+	gen/test_xsave
 
 bench:
 	@test -n "$(WINE)" || { echo "set WINE"; exit 1; }

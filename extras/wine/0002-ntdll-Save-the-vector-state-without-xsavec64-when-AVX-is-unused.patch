@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Timon Stipkovits <timon2201@gmail.com>
+Date: Thu, 26 Nov 2026 18:30:00 +0100
+Subject: [PATCH 2/2] ntdll: Save the vector state without xsavec64 when AVX is
+ unused.
+
+__wine_syscall_dispatcher saves the vector state of every syscall with
+xsavec64, ~30 ns even when only the SSE registers are in use, which at a
+function-call boundary is the normal case.  When XGETBV(1) (XINUSE) says
+the AVX state is in its initial configuration, store exactly what
+xsavec64 would: the SSE registers, MXCSR and its mask, the x87 control
+and status words with an empty tag word (the x87 stack is empty at a
+call; if FSW says otherwise, or an exception is pending, use xsavec64),
+and the same XSTATE_BV/XCOMP_BV header.  NtGetContextThread reports the
+same values either way; only the contents of empty x87 registers and
+the x87 last-instruction pointers differ (zero instead of stale), and AMD
+stores the latter only with an exception pending.
+
+In a benchmark of the real dispatcher this takes a syscall from ~66 to
+~47 ns.  It applies to every NT syscall, normal ones and those trapped
+by Syscall User Dispatch alike (unix calls already save only %xmm6-15).
+Needs XSAVEC and XGETBV with ECX = 1 (Zen and Intel since Skylake);
+WINE_DISABLE_FAST_XSAVE=1 turns it off.
+
+Also fix the xsavec64 path: xsavec64 does not store the SSE registers
+when they are all zero (init optimization), but the return path reloads
+%xmm6-15 from the frame, so they came back with stale values.
+
+Independent of patch 1/2; applies with or without it.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -581,6 +581,29 @@
+ }
+ #endif
+ 
++/* __wine_syscall_dispatcher stores the x87/SSE state with plain moves instead
++ * of xsavec64 when XGETBV(1) says the AVX state is not in use */
++char xinuse_fast_save = 0;
++unsigned int xinuse_mxcsr_mask = 0xffbf;
++
++static void init_xinuse_fast_save(void)
++{
++    XSAVE_FORMAT fx __attribute__((aligned(16)));
++    unsigned int regs[4];
++    const char *env = getenv( "WINE_DISABLE_FAST_XSAVE" );
++
++    if (env && atoi( env )) return;
++    if (!user_shared_data->ProcessorFeatures[PF_XSAVE_ENABLED] ||
++        !(user_shared_data->XState.CompactionEnabled)) return;
++    __asm__( "cpuid" : "=a"(regs[0]), "=b"(regs[1]), "=c"(regs[2]), "=d"(regs[3]) : "a"(0xd), "c"(1) );
++    if (!(regs[0] & 4)) return;  /* XGETBV with ECX = 1 */
++    memset( &fx, 0, sizeof(fx) );
++    __asm__ volatile( "fxsave64 %0" : "=m"(fx) );
++    if (fx.MxCsr_Mask) xinuse_mxcsr_mask = fx.MxCsr_Mask;
++    xinuse_fast_save = 1;
++    TRACE( "storing x87/SSE state without xsavec when AVX is not in use\n" );
++}
++
+ extern void __wine_syscall_dispatcher_instrumentation(void);
+ static void *instrumentation_callback;
+ static pthread_mutex_t instrumentation_callback_mutex = PTHREAD_MUTEX_INITIALIZER;
+@@ -3074,6 +3097,7 @@
+     *(void **)ptr = __wine_syscall_dispatcher;
+ 
+     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
++    init_xinuse_fast_save();
+ 
+     if (wow_teb)
+     {
+@@ -3377,10 +3401,86 @@
+                    "movq %rbp,0x2e8(%rcx)\n\t"
+                    "movq %rbp,0x2f0(%rcx)\n\t"
+                    "movq %rbp,0x2f8(%rcx)\n\t"
++                   /* If the upper halves of the AVX registers are not in use (the
++                    * usual state at a call), xsavec64 would store nothing but the
++                    * x87 and SSE state.  Store exactly that with plain moves,
++                    * which is several times cheaper than xsavec64. */
++                   "cmpb $0," __ASM_NAME("xinuse_fast_save") "(%rip)\n\t"
++                   "je 7f\n\t"
++                   "movq %rcx,%r11\n\t"
++                   "movl $1,%ecx\n\t"
++                   "xgetbv\n\t"                    /* %edx:%eax = XINUSE */
++                   "movq %r11,%rcx\n\t"
++                   "andl $7,%eax\n\t"
++                   "andl 0x7ffe03d8,%eax\n\t"      /* XSTATE_BV xsavec64 would store */
++                   "testl $4,%eax\n\t"             /* AVX state in use */
++                   "jnz 8f\n\t"
++                   "testl $1,%eax\n\t"             /* x87 state in use */
++                   "jz 9f\n\t"
++                   "fnstsw 0xc2(%rcx)\n\t"         /* frame->xsave.StatusWord */
++                   "testw $0x3880,0xc2(%rcx)\n\t"  /* register stack not empty, or exception pending */
++                   "jnz 8f\n\t"
++                   "fnstcw 0xc0(%rcx)\n\t"         /* frame->xsave.ControlWord */
++                   "movl $0,0xc4(%rcx)\n\t"        /* TagWord: all empty, ErrorOpcode */
++                   "movq $0,0xc8(%rcx)\n\t"        /* ErrorOffset/Selector */
++                   "movq $0,0xd0(%rcx)\n"           /* DataOffset/Selector */
++                   "9:\tmovq %rax,0x2c0(%rcx)\n\t"  /* frame->xstate.Mask */
++                   "movl 0x7ffe03d8,%edx\n\t"
++                   "andl $7,%edx\n\t"
++                   "btsq $63,%rdx\n\t"
++                   "movq %rdx,0x2c8(%rcx)\n\t"     /* frame->xstate.CompactionMask */
++                   "movdqa %xmm0,0x160(%rcx)\n\t"  /* frame->xsave.XmmRegisters */
++                   "movdqa %xmm1,0x170(%rcx)\n\t"
++                   "movdqa %xmm2,0x180(%rcx)\n\t"
++                   "movdqa %xmm3,0x190(%rcx)\n\t"
++                   "movdqa %xmm4,0x1a0(%rcx)\n\t"
++                   "movdqa %xmm5,0x1b0(%rcx)\n\t"
++                   "movdqa %xmm6,0x1c0(%rcx)\n\t"
++                   "movdqa %xmm7,0x1d0(%rcx)\n\t"
++                   "movdqa %xmm8,0x1e0(%rcx)\n\t"
++                   "movdqa %xmm9,0x1f0(%rcx)\n\t"
++                   "movdqa %xmm10,0x200(%rcx)\n\t"
++                   "movdqa %xmm11,0x210(%rcx)\n\t"
++                   "movdqa %xmm12,0x220(%rcx)\n\t"
++                   "movdqa %xmm13,0x230(%rcx)\n\t"
++                   "movdqa %xmm14,0x240(%rcx)\n\t"
++                   "movdqa %xmm15,0x250(%rcx)\n\t"
++                   "stmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
++                   "movl " __ASM_NAME("xinuse_mxcsr_mask") "(%rip),%edx\n\t"
++                   "movl %edx,0xdc(%rcx)\n\t"      /* frame->xsave.MxCsr_Mask */
++                   "testl $1,%eax\n\t"
++                   "jz 3f\n\t"
++                   "xorps %xmm0,%xmm0\n\t"         /* empty x87 registers (%xmm0 is volatile) */
++                   "movdqa %xmm0,0xe0(%rcx)\n\t"   /* frame->xsave.FloatRegisters */
++                   "movdqa %xmm0,0xf0(%rcx)\n\t"
++                   "movdqa %xmm0,0x100(%rcx)\n\t"
++                   "movdqa %xmm0,0x110(%rcx)\n\t"
++                   "movdqa %xmm0,0x120(%rcx)\n\t"
++                   "movdqa %xmm0,0x130(%rcx)\n\t"
++                   "movdqa %xmm0,0x140(%rcx)\n\t"
++                   "movdqa %xmm0,0x150(%rcx)\n\t"
++                   "jmp 3f\n"
++                   "8:\tmovl 0x7ffe03d8,%eax\n\t" /* back to the xsavec64 inputs */
++                   "andl $7,%eax\n\t"
++                   "xorl %edx,%edx\n"
+                    /* The xsavec instruction is not supported by
+                     * binutils < 2.25. */
+-                   ".byte 0x48, 0x0f, 0xc7, 0xa1, 0xc0, 0x00, 0x00, 0x00\n\t" /* xsavec64 0xc0(%rcx) */
++                   "7:\t.byte 0x48, 0x0f, 0xc7, 0xa1, 0xc0, 0x00, 0x00, 0x00\n\t" /* xsavec64 0xc0(%rcx) */
+                    "stmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
++                   /* xsavec64 skips the SSE registers when they are all zero, but
++                    * the return path reloads %xmm6-15 from the frame */
++                   "testb $2,0x2c0(%rcx)\n\t"
++                   "jnz 3f\n\t"
++                   "movdqa %xmm6,0x1c0(%rcx)\n\t"
++                   "movdqa %xmm7,0x1d0(%rcx)\n\t"
++                   "movdqa %xmm8,0x1e0(%rcx)\n\t"
++                   "movdqa %xmm9,0x1f0(%rcx)\n\t"
++                   "movdqa %xmm10,0x200(%rcx)\n\t"
++                   "movdqa %xmm11,0x210(%rcx)\n\t"
++                   "movdqa %xmm12,0x220(%rcx)\n\t"
++                   "movdqa %xmm13,0x230(%rcx)\n\t"
++                   "movdqa %xmm14,0x240(%rcx)\n\t"
++                   "movdqa %xmm15,0x250(%rcx)\n\t"
+                    "jmp 3f\n"
+                    "1:\txsave64 0xc0(%rcx)\n\t"
+                    "jmp 3f\n"

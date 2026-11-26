@@ -2,7 +2,7 @@
 #include <linux/prctl.h>
 #include <linux/syscall_user_dispatch.h>
 struct task_struct task, *mock_current = &task; bool mock_ia32;
-unsigned long mock_fault_lo, mock_fault_hi; struct kernel_siginfo mock_last_sig; int mock_sig_count, mock_exit_sig;
+unsigned long mock_fault_lo, mock_fault_hi; struct kernel_siginfo mock_last_sig; int mock_sig_count, mock_exit_sig; bool mock_vdso_sigreturn; int mock_vdso_checks;
 static char sel = 1;
 int main(void) {
 	int a = set_syscall_user_dispatch_handler(0x401000, 0);

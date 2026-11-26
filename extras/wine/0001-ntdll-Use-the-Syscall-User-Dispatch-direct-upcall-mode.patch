@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: FurryMileon <furrymileon@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 15:00:00 +0100
-Subject: [PATCH] ntdll: Use the Syscall User Dispatch direct-upcall mode when
- available.
+Subject: [PATCH 1/2] ntdll: Use the Syscall User Dispatch direct-upcall mode
+ when available.
 
 Every Windows-style syscall stub that falls through to the real syscall
 instruction is currently delivered as SIGSYS.  Some games (THE FINALS) do
@@ -31,20 +31,8 @@ switched off for the thread and the syscall re-executed natively, without
 touching the SysV red zone.  The kernel keeps using SIGSYS for ia32
 syscalls and when TF is set.  The native syscall hack keeps SIGSYS too.
 
-Optional, WINE_SUD_FAST_QPC=1: a fast path for NtQueryPerformanceCounter,
-which THE FINALS calls ~96k times a second through its copied stubs.  It
-builds a normal syscall frame on the syscall stack, so faults, thread
-suspension and context requests see a regular syscall, and leaves
-through the dispatcher's own return path, but skips the XSAVEC: only
-%xmm6-15 and MXCSR are saved, what the Win64 ABI keeps across a call.
-During the call a context request sees stale %xmm0-5, x87 and AVX upper
-state.  About 22 ns less per call in a userspace benchmark of the real
-dispatcher (62 -> 40 ns), i.e. ~0.2% of the game's main thread, so it is
-off by default.  Paths with an instrumentation callback, syscall tracing
-or a %fs switch (WoW64) always take the full dispatcher.
-
 Based on CachyOS/wine-cachyos#37 by FurryMileon; the PUSH_RET entry, the
-probe order and the fast path were added for linux-lunar.  Applies to
+probe order were added for linux-lunar.  Applies to
 wine-cachyos without #37.
 
 Assisted-by: Claude:claude-opus-5-5
@@ -74,7 +62,7 @@ Assisted-by: Claude:claude-opus-5-5
  #ifndef FP_XSTATE_MAGIC1
  #define FP_XSTATE_MAGIC1 0x46505853
  #endif
-@@ -538,7 +554,46 @@
+@@ -538,7 +554,23 @@
  static unsigned int frame_size;
  static unsigned int xstate_size = sizeof(XSAVE_AREA_HEADER);
  static UINT64 xstate_extended_features;
@@ -86,29 +74,6 @@ Assisted-by: Claude:claude-opus-5-5
 +
 +extern void __wine_syscall_dispatcher_upcall(void);
 +extern void __wine_syscall_dispatcher_upcall_push(void);
-+
-+/* NtQueryPerformanceCounter fast path of __wine_syscall_dispatcher_upcall_push,
-+ * read by its assembly; off unless WINE_SUD_FAST_QPC=1 */
-+char __wine_sud_fast_qpc = 0;
-+ULONG __wine_sud_fast_qpc_id = ~0u;
-+void *__wine_sud_fast_qpc_func = NULL;
-+
-+static void init_sud_fast_qpc(void)
-+{
-+    const char *env = getenv( "WINE_SUD_FAST_QPC" );
-+    ULONG i;
-+
-+    if (!env || atoi( env ) <= 0) return;
-+    for (i = 0; i < KeServiceDescriptorTable[0].ServiceLimit; i++)
-+    {
-+        if (KeServiceDescriptorTable[0].ServiceTable[i] != (ULONG_PTR)NtQueryPerformanceCounter) continue;
-+        __wine_sud_fast_qpc_id = i;
-+        __wine_sud_fast_qpc_func = (void *)NtQueryPerformanceCounter;
-+        __wine_sud_fast_qpc = 1;
-+        TRACE_(seh)( "SUD fast path for NtQueryPerformanceCounter (%#x)\n", (int)i );
-+        return;
-+    }
-+}
 +
 +static int register_sud_handler(void)
 +{
@@ -122,7 +87,7 @@ Assisted-by: Claude:claude-opus-5-5
  
  #if defined(__linux__) || defined(__APPLE__)
  static inline TEB *get_current_teb(void)
-@@ -3095,6 +3150,30 @@
+@@ -3095,6 +3127,28 @@
              syscall_dispatch_enabled = FALSE;
          }
      }
@@ -147,13 +112,11 @@ Assisted-by: Claude:claude-opus-5-5
 +        }
 +        if (syscall_dispatch_upcall)
 +            TRACE_(seh)( "SUD direct-upcall mode %d available\n", (int)syscall_dispatch_upcall );
-+        if (syscall_dispatch_upcall == SUD_UPCALL_PUSH_RET && !hack_native_syscalls)
-+            init_sud_fast_qpc();
 +    }
  #endif
  
      emulate_cpuid();
-@@ -3131,9 +3210,20 @@
+@@ -3131,9 +3185,20 @@
          arch_prctl( ARCH_GET_FS, &thread_data->pthread_teb );
          alloc_fs_sel( fs32_sel >> 3, get_wow_teb( teb ));
      }
@@ -177,7 +140,7 @@ Assisted-by: Claude:claude-opus-5-5
  #elif defined (__FreeBSD__) || defined (__FreeBSD_kernel__)
      amd64_set_gsbase( teb );
  #elif defined(__NetBSD__)
-@@ -3582,6 +3672,204 @@
+@@ -3582,6 +3647,147 @@
                     "movl $0x10000,0xb4(%rcx)\n\t"    /* frame->restore_flags <- RESTORE_FLAGS_INSTRUMENTATION */
                     "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") )
  
@@ -279,9 +242,7 @@ Assisted-by: Claude:claude-opus-5-5
 +__ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_upcall_push,
 +                   "cmpl $0," __ASM_NAME("syscall_dispatch_enabled") "(%rip)\n\t"
 +                   "je 2f\n\t"
-+                   "cmpl " __ASM_NAME("__wine_sud_fast_qpc_id") "(%rip),%eax\n\t"
-+                   "je 3f\n"
-+                   "5:\tmovq %gs:0x378,%rcx\n\t"      /* thread_data->syscall_frame */
++                   "movq %gs:0x378,%rcx\n\t"           /* thread_data->syscall_frame */
 +                   "popq 0x70(%rcx)\n\t"               /* frame->rip <- address after the syscall */
 +                   "leaq 128(%rsp),%rsp\n\t"           /* back to %rsp at the syscall */
 +                   "movq %r11,0x80(%rcx)\n\t"          /* frame->eflags */
@@ -322,62 +283,7 @@ Assisted-by: Claude:claude-opus-5-5
 +                   "popq %rcx\n\t"                     /* address after the syscall */
 +                   "leaq -2(%rcx),%rcx\n\t"            /* back to the syscall (lea keeps the flags) */
 +                   "leaq 128(%rsp),%rsp\n\t"           /* %rsp at the syscall */
-+                   "jmp *%rcx\n"
-+                   /* NtQueryPerformanceCounter fast path (WINE_SUD_FAST_QPC=1): a normal
-+                    * syscall frame on the syscall stack, so faults, suspension and context
-+                    * requests behave as usual, but without the XSAVEC: only %xmm6-15 and
-+                    * MXCSR are saved, the parts of the vector state the Win64 ABI keeps
-+                    * across a call.  Leaves through the dispatcher's own return path. */
-+                   "3:\tcmpb $0," __ASM_NAME("__wine_sud_fast_qpc") "(%rip)\n\t"
-+                   "je 5b\n\t"
-+                   "movq %gs:0x330,%rcx\n\t"           /* thread_data->instrumentation_callback */
-+                   "cmpq $0,(%rcx)\n\t"
-+                   "jne 5b\n\t"
-+                   "testl $1,%gs:0x380\n\t"            /* thread_data->syscall_trace */
-+                   "jnz 5b\n\t"
-+                   "cmpq $0,%gs:0x320\n\t"             /* thread_data->pthread_teb: %fs switch needed */
-+                   "jne 5b\n\t"
-+                   "movq %gs:0x378,%rcx\n\t"           /* thread_data->syscall_frame */
-+                   "popq 0x70(%rcx)\n\t"               /* frame->rip <- address after the syscall */
-+                   "leaq 128(%rsp),%rsp\n\t"           /* back to %rsp at the syscall */
-+                   "movq %r11,0x80(%rcx)\n\t"          /* frame->eflags */
-+                   "movq %rbx,0x08(%rcx)\n\t"
-+                   "movq %rdx,0x18(%rcx)\n\t"
-+                   "movq %rsi,0x20(%rcx)\n\t"
-+                   "movq %rdi,0x28(%rcx)\n\t"
-+                   "movq %r12,0x50(%rcx)\n\t"
-+                   "movq %r13,0x58(%rcx)\n\t"
-+                   "movq %r14,0x60(%rcx)\n\t"
-+                   "movq %r15,0x68(%rcx)\n\t"
-+                   "movw %cs,0x78(%rcx)\n\t"
-+                   "movq %rsp,0x88(%rcx)\n\t"
-+                   "movw %ss,0x90(%rcx)\n\t"
-+                   "movq %rbp,0x98(%rcx)\n\t"
-+                   "movl %eax,0xb0(%rcx)\n\t"          /* frame->syscall_id */
-+                   "movl $0,0xb4(%rcx)\n\t"            /* frame->restore_flags */
-+                   "movq $0,0x2c0(%rcx)\n\t"           /* xstate header: no extended state saved */
-+                   "movq $0,0x2c8(%rcx)\n\t"
-+                   "movq $0,0x2d0(%rcx)\n\t"
-+                   "stmxcsr 0xd8(%rcx)\n\t"            /* frame->xsave.MxCsr */
-+                   "movaps %xmm6,0x1c0(%rcx)\n\t"
-+                   "movaps %xmm7,0x1d0(%rcx)\n\t"
-+                   "movaps %xmm8,0x1e0(%rcx)\n\t"
-+                   "movaps %xmm9,0x1f0(%rcx)\n\t"
-+                   "movaps %xmm10,0x200(%rcx)\n\t"
-+                   "movaps %xmm11,0x210(%rcx)\n\t"
-+                   "movaps %xmm12,0x220(%rcx)\n\t"
-+                   "movaps %xmm13,0x230(%rcx)\n\t"
-+                   "movaps %xmm14,0x240(%rcx)\n\t"
-+                   "movaps %xmm15,0x250(%rcx)\n\t"
-+                   "movq %gs:0x30,%r13\n\t"            /* teb */
-+                   "movq %rcx,%rsp\n\t"                /* switch to the syscall stack */
-+                   "movb $0,0x340(%r13)\n\t"           /* amd64_thread_data()->syscall_dispatch */
-+                   "ldmxcsr 0x33c(%r13)\n\t"           /* amd64_thread_data()->mxcsr */
-+                   "cld\n\t"
-+                   "movq %r10,%rdi\n\t"                /* counter */
-+                   "movq %rdx,%rsi\n\t"                /* frequency */
-+                   "call *" __ASM_NAME("__wine_sud_fast_qpc_func") "(%rip)\n\t"
-+                   "jmp " __ASM_NAME("__wine_syscall_dispatcher_return") )
++                   "jmp *%rcx" )
 +
  
  /***********************************************************************

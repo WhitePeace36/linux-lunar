@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Timon Stipkovits <timon2201@gmail.com>
 Date: Thu, 26 Nov 2026 16:00:00 +0100
-Subject: [PATCH 15/15] x86/tsc: Don't watchdog the TSC on single-socket AMD Zen
+Subject: [PATCH 15/16] x86/tsc: Don't watchdog the TSC on single-socket AMD Zen
 
 Since commit b50db7095fe0 ("x86/tsc: Disable clocksource watchdog for
 TSC on qualified platorms") the clocksource watchdog leaves the TSC

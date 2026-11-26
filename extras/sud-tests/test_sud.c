@@ -13,6 +13,8 @@ bool mock_ia32;
 unsigned long mock_fault_lo, mock_fault_hi;
 struct kernel_siginfo mock_last_sig;
 int mock_sig_count, mock_exit_sig;
+bool mock_vdso_sigreturn;
+int mock_vdso_checks;
 
 static int failures, checks;
 #define CHECK(c) do { checks++; if (!(c)) { failures++; \
@@ -42,6 +44,8 @@ static void reset(void)
 	mock_ia32 = false;
 	mock_fault_lo = mock_fault_hi = 0;
 	mock_sig_count = mock_exit_sig = 0;
+	mock_vdso_sigreturn = false;
+	mock_vdso_checks = 0;
 	memset(&mock_last_sig, 0, sizeof(mock_last_sig));
 	for (int i = 0; i < 64; i++) stack[i] = 0xa5a5a5a5a5a5a5a5UL;
 	regs = (struct pt_regs){ .ip = RET, .sp = (unsigned long)&stack[48], .cx = RET,
@@ -205,6 +209,38 @@ int main(void)
 	CHECK(syscall_user_dispatch_get_config(&task, sizeof(cfg), &cfg) == 0);
 	CHECK(cfg.mode == PR_SYS_DISPATCH_ON && cfg.offset == 0x1000 && cfg.len == 0x1000);
 	CHECK(syscall_user_dispatch_set_config(&task, sizeof(cfg), &cfg) == 0);
+
+	/* 12. decision table: selector state x vDSO sigreturn, same outcome as the
+	 * original check order (sigreturn first, then the selector) */
+	struct { const char *what; int sel; int fault; bool sigret; int want; } dt[] = {
+		/* want: 0 allowed, 1 dispatched (SIGSYS, plain mode), 2 killed SIGSYS, 3 killed SIGSEGV */
+		{ "ALLOW",            SYSCALL_DISPATCH_FILTER_ALLOW, 0, false, 0 },
+		{ "ALLOW+sigreturn",  SYSCALL_DISPATCH_FILTER_ALLOW, 0, true,  0 },
+		{ "BLOCK",            SYSCALL_DISPATCH_FILTER_BLOCK, 0, false, 1 },
+		{ "BLOCK+sigreturn",  SYSCALL_DISPATCH_FILTER_BLOCK, 0, true,  0 },
+		{ "invalid",          5, 0, false, 2 },
+		{ "invalid+sigreturn",5, 0, true,  0 },
+		{ "fault",            0, 1, false, 3 },
+		{ "fault+sigreturn",  0, 1, true,  0 },
+		{ "none",            -1, 0, false, 1 },
+		{ "none+sigreturn",  -1, 0, true,  0 },
+	};
+	for (unsigned i = 0; i < sizeof(dt) / sizeof(dt[0]); i++) {
+		reset();
+		CHECK(arm(PR_SYS_DISPATCH_ON) == 0);
+		if (dt[i].sel < 0) task.syscall_dispatch.selector = NULL;
+		else selector = dt[i].sel;
+		if (dt[i].fault) { mock_fault_lo = (unsigned long)&selector; mock_fault_hi = mock_fault_lo + 1; }
+		mock_vdso_sigreturn = dt[i].sigret;
+		bool r = syscall_user_dispatch(&regs);
+		int got = !r ? 0 : mock_exit_sig == SIGSYS ? 2 : mock_exit_sig == SIGSEGV ? 3 : mock_sig_count == 1 ? 1 : -1;
+		if (got != dt[i].want) printf("  decision %-18s got %d want %d\n", dt[i].what, got, dt[i].want);
+		CHECK(got == dt[i].want);
+#ifdef SELECTOR_FIRST
+		if (dt[i].sel == SYSCALL_DISPATCH_FILTER_ALLOW && !dt[i].fault)
+			CHECK(mock_vdso_checks == 0);	/* allowed syscalls skip the arch call */
+#endif
+	}
 
 	printf("%d/%d checks passed\n", checks - failures, checks);
 	return failures != 0;

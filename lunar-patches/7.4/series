@@ -14,3 +14,4 @@ _patch_khugepaged_trylock     0012-mm-khugepaged-don-t-queue-for-mmap_lock-in-wr
 _patch_thp_shrinker_defer     0013-mm-vmscan-let-global-direct-reclaim-leave-THP-splitt.patch
 _patch_sud_upcall             0014-entry-Add-a-direct-upcall-mode-to-Syscall-User-Dispa.patch
 _patch_tsc_zen_nowatchdog     0015-x86-tsc-Don-t-watchdog-the-TSC-on-single-socket-AMD-.patch
+_patch_sud_fast_allow         0016-entry-Make-allowed-syscalls-cheaper-with-Syscall-Use.patch

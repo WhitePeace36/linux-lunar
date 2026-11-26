@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Timon Stipkovits <timon2201@gmail.com>
+Date: Thu, 26 Nov 2026 18:00:00 +0100
+Subject: [PATCH 16/16] entry: Make allowed syscalls cheaper with Syscall User
+ Dispatch armed
+
+Once a task arms Syscall User Dispatch, every one of its syscalls goes
+through syscall_user_dispatch(), and for Wine that is every thread and
+almost every syscall, nearly all of them allowed by the selector.  For
+each allowed native 64-bit syscall the function currently makes two
+more calls:
+
+ - arch_syscall_is_vdso_sigreturn(), out of line in arch/x86/entry/vdso,
+   which can only return true for ia32 syscalls;
+ - __get_user() for the selector byte, i.e. __get_user_nocheck_1, which
+   executes an LFENCE (ASM_BARRIER_NOSPEC) before the load (7.3 only;
+   7.4 switched to get_user(), which masks the address instead).
+
+Read the selector first, inline, with scoped_user_read_access() and
+unsafe_get_user(): a masked access without a call or a speculation
+barrier.  If it says ALLOW, nothing else needs checking.  The vDSO
+sigreturn check now runs only for syscalls that are not allowed, and
+before a selector fault is turned into SIGSEGV, so every combination of
+selector state and sigreturn gives the same result as before (the
+decision table in extras/sud-tests/test_sud.c checks all of them
+against both orders).
+
+An LFENCE costs ~5 ns in a userspace loop on a Xeon; with the SRSO
+"safe RET" mitigation (Zen 1-4) each of the two calls also goes through
+the return thunk.  Armed allowed syscalls measured 10-15 ns slower than
+unarmed ones on 6.18 before this change.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ kernel/entry/syscall_user_dispatch.c | 49 ++++++++++++++++++----------
+ 1 file changed, 32 insertions(+), 17 deletions(-)
+
+diff --git a/kernel/entry/syscall_user_dispatch.c b/kernel/entry/syscall_user_dispatch.c
+index 609fca7d5..28b1e33ab 100644
+--- a/kernel/entry/syscall_user_dispatch.c
++++ b/kernel/entry/syscall_user_dispatch.c
+@@ -110,31 +110,46 @@ bool syscall_user_dispatch(struct pt_regs *regs)
+ {
+ 	struct syscall_user_dispatch *sd = &current->syscall_dispatch;
+-	char state;
++	char __user *selector = sd->selector;
++	char state = SYSCALL_DISPATCH_FILTER_BLOCK;
+ 
+ 	if (likely(instruction_pointer(regs) - sd->offset < sd->len))
+ 		return false;
+ 
+-	if (unlikely(arch_syscall_is_vdso_sigreturn(regs)))
+-		return false;
+-
+-	if (likely(sd->selector)) {
+-		/*
+-		 * access_ok() is performed once, at prctl time, when
+-		 * the selector is loaded by userspace.
+-		 */
+-		if (unlikely(__get_user(state, sd->selector))) {
+-			force_exit_sig(SIGSEGV);
+-			return true;
+-		}
++	/*
++	 * This runs on every syscall of a task with dispatch armed, and the
++	 * selector says ALLOW for most of them, so read it first: then
++	 * nothing else needs checking.  The read is inline and masked
++	 * instead of a call to the __get_user() helper and its speculation
++	 * barrier (LFENCE on x86), and the vDSO sigreturn check, a call into
++	 * arch code, only runs for syscalls that are not allowed.  The
++	 * outcome is the same for every combination as with the checks in
++	 * their old order.
++	 */
++	if (likely(selector)) {
++		selector = untagged_addr(selector);
++		scoped_user_read_access(selector, efault)
++			unsafe_get_user(state, selector, efault);
+ 
+ 		if (likely(state == SYSCALL_DISPATCH_FILTER_ALLOW))
+ 			return false;
++	}
+ 
+-		if (state != SYSCALL_DISPATCH_FILTER_BLOCK) {
+-			force_exit_sig(SIGSYS);
+-			return true;
+-		}
++	if (unlikely(arch_syscall_is_vdso_sigreturn(regs)))
++		return false;
++
++	if (selector && state != SYSCALL_DISPATCH_FILTER_BLOCK) {
++		force_exit_sig(SIGSYS);
++		return true;
+ 	}
++	goto dispatch;
++
++efault:
++	/* The selector can't be read: as before, a vDSO sigreturn still passes. */
++	if (unlikely(arch_syscall_is_vdso_sigreturn(regs)))
++		return false;
++	force_exit_sig(SIGSEGV);
++	return true;
+ 
++dispatch:
+ 	sd->on_dispatch = true;
+ 	syscall_rollback(current, regs);
