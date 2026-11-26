@@ -12,3 +12,4 @@ _patch_gpu_highpri_wq         0010-drm-run-GPU-job-submission-and-display-commit
 _patch_boost_min_wmark_checks 0011-mm-ignore-the-watermark-boost-in-the-remaining-would-.patch
 _patch_khugepaged_trylock     0012-mm-khugepaged-don-t-queue-for-mmap_lock-in-write-mode.patch
 _patch_thp_shrinker_defer     0013-mm-vmscan-let-global-direct-reclaim-leave-THP-splitt.patch
+_patch_sud_upcall             0014-entry-Add-a-direct-upcall-mode-to-Syscall-User-Dispa.patch

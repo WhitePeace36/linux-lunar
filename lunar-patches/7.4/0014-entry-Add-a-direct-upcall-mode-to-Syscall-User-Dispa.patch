@@ -1,0 +1,487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FurryMileon <furrymileon@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:00:00 +0100
+Subject: [PATCH 14/14] entry: Add a direct-upcall mode to Syscall User Dispatch
+
+Syscall User Dispatch delivers every blocked syscall as SIGSYS.  Wine
+relies on it for Windows-style syscall stubs, and some Windows games
+(seen with THE FINALS) issue them at 100-200k/s on their main thread.
+Each trap costs a full signal round trip: signal frame setup with an
+XSAVE of the complete extended state, the handler, and rt_sigreturn
+with XRSTOR.  On Zen 4 with the TSA and SRSO mitigations that is about
+1.5 us per trap even for an empty handler, and over a third of the game
+thread's CPU time.
+
+Add an opt-in mode that resumes userspace at a registered handler
+instead:
+
+  prctl(PR_SET_SYSCALL_USER_DISPATCH_HANDLER, handler, flags, 0, 0)
+        Registers the per-task handler (user address).  0 clears it;
+        clearing while upcall mode is armed fails with -EBUSY.  The
+        handler is not inherited: clone and exec reset it together with
+        the rest of the dispatch state.
+
+  prctl(PR_SET_SYSCALL_USER_DISPATCH,
+        PR_SYS_DISPATCH_UPCALL_{EXCLUSIVE,INCLUSIVE}_ON, off, len, sel)
+        Same as the existing modes, but a blocked native 64-bit syscall
+        resumes at the handler.  Fails with -EINVAL if no handler is
+        registered or on non-x86_64 kernels.
+
+With flags = 0 the handler is entered with the register state of the
+SYSCALL instruction: RCX = address after the syscall, R11 = RFLAGS,
+RAX = syscall number, everything else untouched.  RCX != RIP makes
+do_syscall_64() leave through IRET.
+
+With flags = PR_SYS_DISPATCH_HANDLER_PUSH_RET the handler is entered
+like a CALL: the return address is pushed below the 128-byte red zone,
+RCX = RIP = handler and R11 = RFLAGS, which is what SYSRET loads, so the
+kernel leaves through SYSRET instead of IRET.  The return address is
+ordinary stack memory above the new RSP, so signal frames and contexts
+changed by a debugger keep it like any call frame.  If the stack cannot
+be written the syscall is reported with SIGSYS, with nothing changed.
+Kernels without the flag reject a non-zero flags argument, so userspace
+can probe for it.
+
+ia32 syscalls (including int $0x80 from 64-bit code) and syscalls
+issued with TF set keep using SIGSYS: the handler could not tell the
+ABI apart or recover the argument in RCX, a 64-bit handler cannot run
+on a 32-bit code segment, and with TF the first handler instruction
+would trap before it could save the single-step state the way a SIGSYS
+handler does.
+
+PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG reports the upcall modes.  It
+also reports inclusive ranges as the inclusive range they were armed
+with: they are stored inverted, and the exclusive form it reported so
+far is rejected by PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG, so a
+get/set round trip (checkpoint/restore) failed for them.
+
+The handler option uses a magic number and the modes carry bit 31, so
+neither can collide with values upstream assigns later; kernels without
+this patch return -EINVAL for both.
+
+Measured by the original author in a KVM guest on a Ryzen 9 7950X3D
+(2M traps, empty handler): native getpid 224 ns, SIGSYS dispatch
+1482 ns, upcall dispatch 244 ns.  tools/sudtrap.c measures all modes.
+
+Based on CachyOS/linux#15 by FurryMileon (the flags = 0 mode is
+unchanged, so CachyOS/wine-cachyos#37 works as is).  Changes for
+linux-lunar: the PUSH_RET mode, the inclusive-range ptrace fix, a
+handler flags argument, documentation of the handler's entry state
+(DF, ENDBR64, shadow stack).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../admin-guide/syscall-user-dispatch.rst     |  60 ++++++-
+ include/linux/syscall_user_dispatch.h         |  25 ++-
+ include/linux/syscall_user_dispatch_types.h   |   3 +
+ include/uapi/linux/prctl.h                    |  26 +++
+ kernel/entry/syscall_user_dispatch.c          | 148 +++++++++++++++++-
+ kernel/sys.c                                  |   5 +
+ 6 files changed, 258 insertions(+), 9 deletions(-)
+
+diff --git a/Documentation/admin-guide/syscall-user-dispatch.rst b/Documentation/admin-guide/syscall-user-dispatch.rst
+index c1768d9e8..5a051a4a6 100644
+--- a/Documentation/admin-guide/syscall-user-dispatch.rst
++++ b/Documentation/admin-guide/syscall-user-dispatch.rst
+@@ -82,6 +82,64 @@ Additionally, a tasks syscall user dispatch configuration can be peeked
+ and poked via the PTRACE_(GET|SET)_SYSCALL_USER_DISPATCH_CONFIG ptrace
+ requests. This is useful for checkpoint/restart software.
+ 
++Direct upcall (x86-64)
++----------------------
++
++Delivering every blocked syscall as SIGSYS costs a full signal round
++trip, including saving and restoring the complete extended FPU state.
++Applications that trap at high rates can instead have blocked syscalls
++resume directly at a user-mode handler::
++
++  prctl(PR_SET_SYSCALL_USER_DISPATCH_HANDLER, <handler>, 0, 0, 0)
++  prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_UPCALL_EXCLUSIVE_ON,
++        <offset>, <length>, [selector])
++
++PR_SYS_DISPATCH_UPCALL_EXCLUSIVE_ON and PR_SYS_DISPATCH_UPCALL_INCLUSIVE_ON
++select the dispatch range like their non-upcall counterparts.  A blocked
++native 64-bit syscall then continues at <handler> with the register state
++the SYSCALL instruction itself produces: RCX holds the address of the
++instruction following the syscall, R11 holds RFLAGS and RAX holds the
++syscall number.  All other registers, the stack, the FPU state and the
++signal mask are left untouched, and no signal is queued.  The handler
++typically emulates the syscall and continues at RCX.
++
++ia32 syscalls (including int $0x80 from 64-bit code) and syscalls issued
++with the trap flag set are still reported with SIGSYS, so a SIGSYS handler
++remains necessary.
++
++The handler is per-task state.  Arming an upcall mode without a handler
++fails with EINVAL, clearing the handler (passing 0) while an upcall mode
++is armed fails with EBUSY, and the handler is reset together with the
++rest of the configuration on clone and exec, so every new thread has to
++register it again.  PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG reports
++PR_SYS_DISPATCH_UPCALL_EXCLUSIVE_ON for tasks in upcall mode; the handler
++itself is not part of the ptrace configuration, so a restored task must
++register it before the configuration can be applied.
++
++The handler runs with the RFLAGS of the syscall site, so it cannot rely on
++DF being clear.  Like any indirect branch target it should start with
++ENDBR64.  It is entered without a shadow stack entry, so it returns to the
++syscall site with a jump, not RET.
++
++Entering the handler like a CALL
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Because RCX holds the return address, the kernel has to leave through IRET
++instead of the faster SYSRET (which loads RIP from RCX).  Registering the
++handler with a flag changes that::
++
++  prctl(PR_SET_SYSCALL_USER_DISPATCH_HANDLER, <handler>,
++        PR_SYS_DISPATCH_HANDLER_PUSH_RET, 0, 0)
++
++A blocked syscall then continues at <handler> with the address of the
++instruction following the syscall pushed onto the user stack, below the
++128-byte red zone: [RSP] holds the return address and the stack pointer of
++the syscall site is RSP + 8 + 128.  RCX holds the handler address, R11 holds
++RFLAGS and RAX holds the syscall number; all other registers are left
++untouched.  If the stack cannot be written, the syscall is reported with
++SIGSYS instead.  Kernels without the flag reject it with EINVAL, so
++userspace can try it first and fall back to registering without it.
++
+ Security Notes
+ --------------
+ 
+@@ -96,4 +154,4 @@ address and modify the selector value.  If the use case requires any
+ kind of security sandboxing, Seccomp should be used instead.
+ 
+ Any fork or exec of the existing process resets the mechanism to
+-PR_SYS_DISPATCH_OFF.
++PR_SYS_DISPATCH_OFF and clears the upcall handler.
+diff --git a/include/linux/syscall_user_dispatch.h b/include/linux/syscall_user_dispatch.h
+index 3dd30f4b2..8b5d1f20f 100644
+--- a/include/linux/syscall_user_dispatch.h
++++ b/include/linux/syscall_user_dispatch.h
+@@ -27,8 +27,23 @@ static __always_inline bool syscall_user_dispatch_clear_on_dispatch(void)
+ int set_syscall_user_dispatch(unsigned long mode, unsigned long offset,
+ 			      unsigned long len, char __user *selector);
+ 
+-#define clear_syscall_work_syscall_user_dispatch(tsk) \
+-	clear_task_syscall_work(tsk, SYSCALL_USER_DISPATCH)
++int set_syscall_user_dispatch_handler(unsigned long handler, unsigned long flags);
++
++/*
++ * Reset per-task Syscall User Dispatch state on clone (copy_process) and
++ * exec.  The upcall handler is per-task state and is never inherited: a
++ * stale handler address must not carry into a different binary (think
++ * setuid exec), and each new thread registers its own handler before
++ * arming upcall mode.
++ */
++static inline void clear_syscall_work_syscall_user_dispatch(struct task_struct *tsk)
++{
++	clear_task_syscall_work(tsk, SYSCALL_USER_DISPATCH);
++	tsk->syscall_dispatch.handler = 0;
++	tsk->syscall_dispatch.handler_flags = 0;
++	tsk->syscall_dispatch.on_dispatch = false;
++	tsk->syscall_dispatch.on_upcall = false;
++}
+ 
+ int syscall_user_dispatch_get_config(struct task_struct *task, unsigned long size,
+ 				     void __user *data);
+@@ -54,6 +69,12 @@ static inline int set_syscall_user_dispatch(unsigned long mode, unsigned long of
+ 	return -EINVAL;
+ }
+ 
++static inline int set_syscall_user_dispatch_handler(unsigned long handler,
++						    unsigned long flags)
++{
++	return -EINVAL;
++}
++
+ static inline void clear_syscall_work_syscall_user_dispatch(struct task_struct *tsk)
+ {
+ }
+diff --git a/include/linux/syscall_user_dispatch_types.h b/include/linux/syscall_user_dispatch_types.h
+index c0bdd4f76..2ceb6be6d 100644
+--- a/include/linux/syscall_user_dispatch_types.h
++++ b/include/linux/syscall_user_dispatch_types.h
+@@ -10,7 +10,10 @@ struct syscall_user_dispatch {
+ 	char __user	*selector;
+ 	unsigned long	offset;
+ 	unsigned long	len;
++	unsigned long	handler;	/* user address jumped to on block when on_upcall */
++	unsigned long	handler_flags;	/* PR_SYS_DISPATCH_HANDLER_* */
+ 	bool		on_dispatch;
++	bool		on_upcall;	/* dispatch bypasses SIGSYS, jumps to handler */
+ };
+ 
+ #else
+diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
+index b6ec6f693..7e01a88c2 100644
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -271,6 +271,17 @@ struct prctl_mm_map {
+ # define PR_SYS_DISPATCH_EXCLUSIVE_ON	1
+ /* Enable dispatch for the specified range */
+ # define PR_SYS_DISPATCH_INCLUSIVE_ON	2
++/*
++ * Like the modes above, but a blocked native 64-bit syscall resumes at the
++ * handler registered with PR_SET_SYSCALL_USER_DISPATCH_HANDLER instead of
++ * raising SIGSYS.  See Documentation/admin-guide/syscall-user-dispatch.rst.
++ *
++ * Bit 31 keeps these values clear of future upstream PR_SYS_DISPATCH_*
++ * values, so kernels without upcall support return -EINVAL.
++ */
++# define PR_SYS_DISPATCH_UPCALL_EXCLUSIVE_ON	(0x80000000U | 3)
++/* Same as above but for the inclusive range */
++# define PR_SYS_DISPATCH_UPCALL_INCLUSIVE_ON	(0x80000000U | 4)
+ /* Legacy name for backwards compatibility */
+ # define PR_SYS_DISPATCH_ON		PR_SYS_DISPATCH_EXCLUSIVE_ON
+ /* The control values for the user space selector when dispatch is enabled */
+@@ -416,4 +427,19 @@ struct prctl_mm_map {
+ # define PR_CFI_DISABLE		_BITUL(1)
+ # define PR_CFI_LOCK		_BITUL(2)
+ 
++/*
++ * Register the per-task handler used by PR_SYS_DISPATCH_UPCALL_*_ON.
++ * arg2 is the handler address (0 clears it), arg3 the flags below,
++ * arg4 and arg5 must be zero.  Clearing the handler while upcall mode is
++ * armed fails with -EBUSY; arming upcall mode without a handler fails
++ * with -EINVAL.  Kernels that know no flags reject a non-zero arg3 with
++ * -EINVAL, so a caller can probe for them.
++ */
++#define PR_SET_SYSCALL_USER_DISPATCH_HANDLER	0x53554448	/* "SUDH" */
++/*
++ * Enter the handler like a CALL: the return address is pushed below the
++ * 128-byte red zone, RCX = handler.  Lets the kernel return with SYSRET.
++ */
++# define PR_SYS_DISPATCH_HANDLER_PUSH_RET	(1UL << 0)
++
+ #endif /* _LINUX_PRCTL_H */
+diff --git a/kernel/entry/syscall_user_dispatch.c b/kernel/entry/syscall_user_dispatch.c
+index 7d1dd7f1b..12575db9f 100644
+--- a/kernel/entry/syscall_user_dispatch.c
++++ b/kernel/entry/syscall_user_dispatch.c
+@@ -33,6 +33,79 @@ static void trigger_sigsys(struct pt_regs *regs)
+ 	force_sig_info(&info);
+ }
+ 
++#ifdef CONFIG_X86_64
++/*
++ * The upcall contract mirrors the 64-bit SYSCALL instruction, so it is
++ * only used for native 64-bit syscalls that are not being single-stepped.
++ * ia32 syscalls (int $0x80 / sysenter / 32-bit SYSCALL, including int
++ * $0x80 issued from 64-bit code) and TF-traced ones keep using SIGSYS:
++ * the handler could neither tell the ABI apart nor recover the argument
++ * register that RCX overwrites, a 64-bit handler cannot run on a 32-bit
++ * CS, and with TF set the first handler instruction would trap before it
++ * could save the single-step state the way a SIGSYS handler does.
++ */
++static bool can_upcall(struct syscall_user_dispatch *sd, struct pt_regs *regs)
++{
++	return sd->on_upcall && user_64bit_mode(regs) && !in_ia32_syscall() &&
++	       !(regs->flags & X86_EFLAGS_TF);
++}
++
++/* The x86-64 SysV red zone, which the push-return mode must not touch. */
++#define SUD_UPCALL_REDZONE	128
++
++static bool trigger_upcall(struct syscall_user_dispatch *sd, struct pt_regs *regs)
++{
++	unsigned long ret = regs->ip;	/* address after the syscall */
++
++	/*
++	 * Hand off to the user-mode handler installed via
++	 * PR_SET_SYSCALL_USER_DISPATCH_HANDLER.  RAX holds the syscall
++	 * number (restored by syscall_rollback()), R11 = RFLAGS.  No signal
++	 * frame, no FPU save, signal mask untouched.
++	 */
++	if (sd->handler_flags & PR_SYS_DISPATCH_HANDLER_PUSH_RET) {
++		/*
++		 * Push the return address like a CALL would, below the red
++		 * zone so interrupted SysV code keeps its scratch data:
++		 * [RSP] = return address, the syscall's RSP = RSP + 8 + 128.
++		 * RCX = RIP = handler and R11 = RFLAGS is exactly what SYSRET
++		 * loads, so do_syscall_64() leaves through SYSRET instead of
++		 * IRET.  The return address is ordinary stack memory above
++		 * the new RSP, so a signal frame or a context switched by a
++		 * debugger keeps it, as it would keep any call frame.  If the
++		 * stack cannot be written, nothing has been changed yet:
++		 * report the syscall with SIGSYS as before.
++		 */
++		unsigned long sp = regs->sp - SUD_UPCALL_REDZONE - sizeof(u64);
++
++		if (unlikely(put_user((u64)ret, (u64 __user *)sp)))
++			return false;
++		regs->sp = sp;
++		regs->cx = sd->handler;
++	} else {
++		/*
++		 * RCX = return address, the register state the SYSCALL
++		 * instruction itself produces.  RCX != RIP makes
++		 * do_syscall_64() leave through IRET.
++		 */
++		regs->cx = ret;
++	}
++	regs->r11 = regs->flags;
++	regs->ip = sd->handler;
++	return true;
++}
++#else
++static bool can_upcall(struct syscall_user_dispatch *sd, struct pt_regs *regs)
++{
++	return false;
++}
++
++static bool trigger_upcall(struct syscall_user_dispatch *sd, struct pt_regs *regs)
++{
++	return false;
++}
++#endif
++
+ bool syscall_user_dispatch(struct pt_regs *regs)
+ {
+ 	struct syscall_user_dispatch *sd = &current->syscall_dispatch;
+@@ -61,7 +134,8 @@ bool syscall_user_dispatch(struct pt_regs *regs)
+ 
+ 	sd->on_dispatch = true;
+ 	syscall_rollback(current, regs);
+-	trigger_sigsys(regs);
++	if (!can_upcall(sd, regs) || !trigger_upcall(sd, regs))
++		trigger_sigsys(regs);
+ 
+ 	return true;
+ }
+@@ -70,11 +144,16 @@ static int task_set_syscall_user_dispatch(struct task_struct *task, unsigned lon
+ 					  unsigned long offset, unsigned long len,
+ 					  char __user *selector)
+ {
++	bool upcall = false;
++
+ 	switch (mode) {
+ 	case PR_SYS_DISPATCH_OFF:
+ 		if (offset || len || selector)
+ 			return -EINVAL;
+ 		break;
++	case PR_SYS_DISPATCH_UPCALL_EXCLUSIVE_ON:
++		upcall = true;
++		fallthrough;
+ 	case PR_SYS_DISPATCH_EXCLUSIVE_ON:
+ 		/*
+ 		 * Validate the direct dispatcher region just for basic
+@@ -85,6 +164,9 @@ static int task_set_syscall_user_dispatch(struct task_struct *task, unsigned lon
+ 		if (offset && offset + len <= offset)
+ 			return -EINVAL;
+ 		break;
++	case PR_SYS_DISPATCH_UPCALL_INCLUSIVE_ON:
++		upcall = true;
++		fallthrough;
+ 	case PR_SYS_DISPATCH_INCLUSIVE_ON:
+ 		if (len == 0 || offset + len <= offset)
+ 			return -EINVAL;
+@@ -99,6 +181,17 @@ static int task_set_syscall_user_dispatch(struct task_struct *task, unsigned lon
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * Upcall mode is x86_64-only and needs a user-space handler
++	 * installed first (TASK_SIZE_MAX is the exclusive upper bound).
++	 */
++	if (upcall) {
++		unsigned long handler = task->syscall_dispatch.handler;
++
++		if (!IS_ENABLED(CONFIG_X86_64) || !handler || handler >= TASK_SIZE_MAX)
++			return -EINVAL;
++	}
++
+ 	/* Arming can be denied at runtime via sysctl, disarming is allowed */
+ 	if (mode != PR_SYS_DISPATCH_OFF && !syscall_user_dispatch_allowed)
+ 		return -EPERM;
+@@ -120,6 +213,7 @@ static int task_set_syscall_user_dispatch(struct task_struct *task, unsigned lon
+ 	task->syscall_dispatch.offset = offset;
+ 	task->syscall_dispatch.len = len;
+ 	task->syscall_dispatch.on_dispatch = false;
++	task->syscall_dispatch.on_upcall = upcall;
+ 
+ 	if (mode != PR_SYS_DISPATCH_OFF)
+ 		set_task_syscall_work(task, SYSCALL_USER_DISPATCH);
+@@ -135,6 +229,33 @@ int set_syscall_user_dispatch(unsigned long mode, unsigned long offset,
+ 	return task_set_syscall_user_dispatch(current, mode, offset, len, selector);
+ }
+ 
++int set_syscall_user_dispatch_handler(unsigned long handler, unsigned long flags)
++{
++	struct syscall_user_dispatch *sd = &current->syscall_dispatch;
++
++	if (!IS_ENABLED(CONFIG_X86_64))
++		return -EINVAL;
++
++	/* Must be a user address (0 is the "clear" sentinel). */
++	if (handler >= TASK_SIZE_MAX)
++		return -EINVAL;
++
++	if (flags & ~PR_SYS_DISPATCH_HANDLER_PUSH_RET)
++		return -EINVAL;
++
++	/* Flags describe how the handler is entered, so they need one. */
++	if (!handler && flags)
++		return -EINVAL;
++
++	/* Can't yank the handler out from under an active upcall arming. */
++	if (!handler && sd->on_upcall)
++		return -EBUSY;
++
++	sd->handler = handler;
++	sd->handler_flags = flags;
++	return 0;
++}
++
+ int syscall_user_dispatch_get_config(struct task_struct *task, unsigned long size,
+ 				     void __user *data)
+ {
+@@ -144,13 +265,28 @@ int syscall_user_dispatch_get_config(struct task_struct *task, unsigned long siz
+ 	if (size != sizeof(cfg))
+ 		return -EINVAL;
+ 
+-	if (test_task_syscall_work(task, SYSCALL_USER_DISPATCH))
+-		cfg.mode = PR_SYS_DISPATCH_ON;
+-	else
+-		cfg.mode = PR_SYS_DISPATCH_OFF;
+-
+ 	cfg.offset = sd->offset;
+ 	cfg.len = sd->len;
++
++	/*
++	 * The inclusive modes store their range inverted, which makes
++	 * offset + len wrap around; an exclusive range never does (arming
++	 * rejects it).  Report an inverted range as the inclusive range it
++	 * came from: in exclusive form PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG
++	 * would reject it, so a get/set round trip (checkpoint/restore)
++	 * could not reproduce the configuration.
++	 */
++	if (!test_task_syscall_work(task, SYSCALL_USER_DISPATCH)) {
++		cfg.mode = PR_SYS_DISPATCH_OFF;
++	} else if (sd->len && sd->offset + sd->len < sd->offset) {
++		cfg.offset = sd->offset + sd->len;
++		cfg.len = -sd->len;
++		cfg.mode = sd->on_upcall ? PR_SYS_DISPATCH_UPCALL_INCLUSIVE_ON :
++					   PR_SYS_DISPATCH_INCLUSIVE_ON;
++	} else {
++		cfg.mode = sd->on_upcall ? PR_SYS_DISPATCH_UPCALL_EXCLUSIVE_ON :
++					   PR_SYS_DISPATCH_EXCLUSIVE_ON;
++	}
+ 	cfg.selector = (__u64)(uintptr_t)sd->selector;
+ 
+ 	if (copy_to_user(data, &cfg, sizeof(cfg)))
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 755bfa5cc..ef4a899e5 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2806,6 +2806,11 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 		error = set_syscall_user_dispatch(arg2, arg3, arg4,
+ 						  (char __user *) arg5);
+ 		break;
++	case PR_SET_SYSCALL_USER_DISPATCH_HANDLER:
++		if (arg4 || arg5)
++			return -EINVAL;
++		error = set_syscall_user_dispatch_handler(arg2, arg3);
++		break;
+ #ifdef CONFIG_SCHED_CORE
+ 	case PR_SCHED_CORE:
+ 		error = sched_core_share_pid(arg2, arg3, arg4, arg5);
