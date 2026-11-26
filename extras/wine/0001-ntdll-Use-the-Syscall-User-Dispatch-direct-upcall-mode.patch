@@ -31,9 +31,9 @@ switched off for the thread and the syscall re-executed natively, without
 touching the SysV red zone.  The kernel keeps using SIGSYS for ia32
 syscalls and when TF is set.  The native syscall hack keeps SIGSYS too.
 
-Based on CachyOS/wine-cachyos#37 by FurryMileon; the PUSH_RET entry, the
-probe order were added for linux-lunar.  Applies to
-wine-cachyos without #37.
+Based on CachyOS/wine-cachyos#37 by FurryMileon; the PUSH_RET entry and
+the probe order were added for linux-lunar.  Applies to wine-cachyos
+without #37.
 
 Assisted-by: Claude:claude-opus-5-5
 ---
